@@ -9,9 +9,18 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:?missing in .env}
     volumes:
       - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
 
   zabbix-server:
     image: zabbix/zabbix-server-pgsql:alpine-7.0.31
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       DB_SERVER_HOST: db
       POSTGRES_USER: ${POSTGRES_USER:?missing in .env}
