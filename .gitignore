@@ -1,0 +1,7 @@
+# secrets
+.env*
+!.env.example
+
+# site profiles: real sites stay local, only the example is tracked
+sites/*.json
+!sites/SITE-EXAMPLE.json
