@@ -10,5 +10,13 @@ services:
     volumes:
       - pg-data:/var/lib/postgresql/data
 
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:alpine-7.0.31
+    environment:
+      DB_SERVER_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:?missing in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?missing in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?missing in .env}
+
 volumes:
   pg-data:
