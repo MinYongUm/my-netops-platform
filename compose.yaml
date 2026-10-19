@@ -44,5 +44,21 @@ services:
     ports:
       - "${ZBX_WEB_PORT:?missing in .env}:8080"
 
+  grafana:
+    image: grafana/grafana:13.2.4
+    depends_on:
+      zabbix-web:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?missing in .env}
+      GF_PLUGINS_PREINSTALL_SYNC: alexanderzobnin-zabbix-app@6.9.1
+      TZ: ${TZ:?missing in .env}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${GRAFANA_PORT:?missing in .env}:3000"
+
 volumes:
   pg-data:
+  grafana-data:
