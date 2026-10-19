@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import secrets
 import sys
 import urllib.error
 import urllib.request
@@ -16,6 +17,11 @@ TIMEOUT = 10  # 모든 API 요청의 응답 대기 한도(초)
 ADMIN_USER = "Admin"
 ADMIN_USERID = "1"  # Zabbix 설치 시 고정
 DEFAULT_ADMIN_PASSWORD = "zabbix"  # down -v 직후의 기본값
+
+GRAFANA_NAME = "grafana"  # Zabbix 쪽 사용자 그룹·사용자·토큰 이름
+READ_HOSTGROUP = "Zabbix servers"  # grafana 가 읽을 수 있는 호스트 그룹
+GRAFANA_ROLE = "User role"
+PERM_READ = 2  # 0 = 거부, 2 = 읽기 전용, 3 = 읽기·쓰기
 
 log = logging.getLogger("bootstrap")
 
@@ -98,6 +104,69 @@ def login_admin(zbx: ZabbixClient, env: dict[str, str]) -> None:
     zbx.login(ADMIN_USER, new_password)
 
 
+def get_id(zbx: ZabbixClient, method: str, id_key: str, name: str) -> str:
+    """이름이 정확히 일치하는 객체의 ID. 없으면 계속할 수 없으므로 ApiError."""
+    found = zbx.call(method, {"output": [id_key], "filter": {"name": [name]}})
+    if not found:
+        raise ApiError(f"{method}: '{name}' 을(를) 찾을 수 없습니다")
+    return found[0][id_key]
+
+
+def ensure_usergroup(zbx: ZabbixClient, hostgroup_id: str) -> str:
+    found = zbx.call(
+        "usergroup.get",
+        {"output": ["usrgrpid"], "filter": {"name": [GRAFANA_NAME]}},
+    )
+    if found:
+        log.info("사용자 그룹 %s 이미 있음", GRAFANA_NAME)
+        return found[0]["usrgrpid"]
+    created = zbx.call(
+        "usergroup.create",
+        {
+            "name": GRAFANA_NAME,
+            "hostgroup_rights": [{"id": hostgroup_id, "permission": PERM_READ}],
+        },
+    )
+    log.info("사용자 그룹 %s 생성", GRAFANA_NAME)
+    return created["usrgrpids"][0]
+
+
+def ensure_user(zbx: ZabbixClient, usrgrpid: str, roleid: str) -> str:
+    found = zbx.call(
+        "user.get",
+        {"output": ["userid"], "filter": {"username": [GRAFANA_NAME]}},
+    )
+    if found:
+        log.info("사용자 %s 이미 있음", GRAFANA_NAME)
+        return found[0]["userid"]
+    # Grafana 는 이 비밀번호를 쓰지 않는다 (API 토큰으로 접속). 만들고 버린다
+    created = zbx.call(
+        "user.create",
+        {
+            "username": GRAFANA_NAME,
+            "passwd": secrets.token_hex(16),
+            "roleid": roleid,
+            "usrgrps": [{"usrgrpid": usrgrpid}],
+        },
+    )
+    log.info("사용자 %s 생성", GRAFANA_NAME)
+    return created["userids"][0]
+
+
+def ensure_token(zbx: ZabbixClient, userid: str) -> str:
+    """토큰 틀만 만든다. 문자열 발급(token.generate)은 Grafana 등록 단계에서."""
+    found = zbx.call(
+        "token.get",
+        {"output": ["tokenid"], "userids": [userid], "filter": {"name": [GRAFANA_NAME]}},
+    )
+    if found:
+        log.info("토큰 %s 이미 있음", GRAFANA_NAME)
+        return found[0]["tokenid"]
+    created = zbx.call("token.create", {"name": GRAFANA_NAME, "userid": userid})
+    log.info("토큰 %s 생성", GRAFANA_NAME)
+    return created["tokenids"][0]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Zabbix/Grafana 초기 설정")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -113,6 +182,15 @@ def main() -> int:
         version = zbx.call("apiinfo.version", {})
         log.info("Zabbix API 응답: %s", version)
         login_admin(zbx, env)
+
+        hostgroup_id = get_id(zbx, "hostgroup.get", "groupid", READ_HOSTGROUP)
+        role_id = get_id(zbx, "role.get", "roleid", GRAFANA_ROLE)
+        usrgrpid = ensure_usergroup(zbx, hostgroup_id)
+        userid = ensure_user(zbx, usrgrpid, role_id)
+        tokenid = ensure_token(zbx, userid)
+        log.info("Zabbix 설정 완료 (usrgrpid=%s, userid=%s, tokenid=%s)",
+                 usrgrpid, userid, tokenid)
+
         zbx.logout()
     except ApiError as e:
         log.error("Zabbix API 오류: %s", e)
