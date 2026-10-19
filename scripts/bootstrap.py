@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 
 TIMEOUT = 10  # 모든 API 요청의 응답 대기 한도(초)
+ADMIN_USER = "Admin"
+ADMIN_USERID = "1"  # Zabbix 설치 시 고정
+DEFAULT_ADMIN_PASSWORD = "zabbix"  # down -v 직후의 기본값
 
 log = logging.getLogger("bootstrap")
 
@@ -57,6 +60,43 @@ class ZabbixClient:
             raise ApiError(f"{method}: {data['error'].get('data')}")
         return data["result"]
 
+    def login(self, username: str, password: str) -> None:
+        # user.login 은 인증 헤더 없이 보내야 하므로 기존 세션을 먼저 비운다
+        self.session = None
+        self.session = self.call(
+            "user.login", {"username": username, "password": password}
+        )
+
+    def logout(self) -> None:
+        if self.session:
+            self.call("user.logout", [])
+            self.session = None
+
+
+def login_admin(zbx: ZabbixClient, env: dict[str, str]) -> None:
+    """.env 비밀번호로 로그인. 안 되면 기본 비밀번호로 로그인해 .env 값으로 바꾼다."""
+    new_password = env["ZBX_ADMIN_PASSWORD"]
+    try:
+        zbx.login(ADMIN_USER, new_password)
+        log.info("Admin 로그인 (.env 비밀번호)")
+        return
+    except ApiError:
+        log.info("Admin .env 비밀번호 로그인 실패. 기본 비밀번호로 시도합니다.")
+
+    # 여기서도 실패하면 ApiError 가 main 까지 올라가 중단된다
+    zbx.login(ADMIN_USER, DEFAULT_ADMIN_PASSWORD)
+    zbx.call(
+        "user.update",
+        {
+            "userid": ADMIN_USERID,
+            "current_passwd": DEFAULT_ADMIN_PASSWORD,
+            "passwd": new_password,
+        },
+    )
+    log.info("Admin 기본 비밀번호를 .env 값으로 변경")
+    # 비밀번호 변경 후 기존 세션이 끊길 수 있으므로 새로 로그인한다
+    zbx.login(ADMIN_USER, new_password)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Zabbix/Grafana 초기 설정")
@@ -72,6 +112,8 @@ def main() -> int:
     try:
         version = zbx.call("apiinfo.version", {})
         log.info("Zabbix API 응답: %s", version)
+        login_admin(zbx, env)
+        zbx.logout()
     except ApiError as e:
         log.error("Zabbix API 오류: %s", e)
         return 1
