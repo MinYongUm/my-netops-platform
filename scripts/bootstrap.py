@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import secrets
@@ -22,6 +23,11 @@ GRAFANA_NAME = "grafana"  # Zabbix 쪽 사용자 그룹·사용자·토큰 이�
 READ_HOSTGROUP = "Zabbix servers"  # grafana 가 읽을 수 있는 호스트 그룹
 GRAFANA_ROLE = "User role"
 PERM_READ = 2  # 0 = 거부, 2 = 읽기 전용, 3 = 읽기·쓰기
+
+ZBX_APP_ID = "alexanderzobnin-zabbix-app"
+DS_NAME = "Zabbix"
+# Grafana 컨테이너에서 보는 주소. 호스트 포트(8081)가 아니라 compose 서비스 이름과 내부 포트
+DS_URL = "http://zabbix-web:8080/api_jsonrpc.php"
 
 log = logging.getLogger("bootstrap")
 
@@ -77,6 +83,34 @@ class ZabbixClient:
         if self.session:
             self.call("user.logout", [])
             self.session = None
+
+
+class GrafanaClient:
+    """Grafana HTTP API 호출. 매 요청 Basic 인증(admin)."""
+
+    def __init__(self, url: str, user: str, password: str) -> None:
+        self.url = url
+        cred = base64.b64encode(f"{user}:{password}".encode()).decode()
+        self.auth = f"Basic {cred}"
+
+    def request(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        """상태 코드와 JSON 을 반환한다. 404·409 같은 판단은 호출한 쪽에서."""
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method)
+        req.add_header("Authorization", self.auth)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return resp.status, json.load(resp)
+        except urllib.error.HTTPError as e:
+            # urllib 은 4xx/5xx 를 예외로 던진다. 여기서 잡지 않으면
+            # main 에서 연결 실패(URLError)로 잘못 처리된다
+            try:
+                payload = json.load(e)
+            except json.JSONDecodeError:
+                payload = {}
+            return e.code, payload
 
 
 def login_admin(zbx: ZabbixClient, env: dict[str, str]) -> None:
@@ -167,6 +201,84 @@ def ensure_token(zbx: ZabbixClient, userid: str) -> str:
     return created["tokenids"][0]
 
 
+def generate_token(zbx: ZabbixClient, tokenid: str) -> str:
+    """토큰 문자열 발급. 부를 때마다 새 문자열이 나오고 이전 것은 무효가 된다."""
+    result = zbx.call("token.generate", [tokenid])
+    log.info("토큰 %s 문자열 발급", GRAFANA_NAME)
+    return result[0]["token"]
+
+
+def enable_plugin(gf: GrafanaClient) -> None:
+    status, data = gf.request("GET", f"/api/plugins/{ZBX_APP_ID}/settings")
+    if status != 200:
+        raise ApiError(f"플러그인 조회 실패: HTTP {status} {data.get('message', '')}")
+    if data.get("enabled"):
+        log.info("Grafana Zabbix 앱 이미 활성화됨")
+        return
+    status, data = gf.request(
+        "POST",
+        f"/api/plugins/{ZBX_APP_ID}/settings",
+        {"enabled": True, "pinned": True, "jsonData": {}},
+    )
+    if status != 200:
+        raise ApiError(f"플러그인 활성화 실패: HTTP {status} {data.get('message', '')}")
+    log.info("Grafana Zabbix 앱 활성화")
+
+
+def datasource_body(token: str) -> dict[str, Any]:
+    return {
+        "name": DS_NAME,
+        "type": "alexanderzobnin-zabbix-datasource",
+        "access": "proxy",
+        "url": DS_URL,
+        "jsonData": {"authType": "token"},
+        "secureJsonData": {"apiToken": token},
+    }
+
+
+def datasource_health(gf: GrafanaClient, uid: str) -> tuple[bool, str]:
+    status, data = gf.request("GET", f"/api/datasources/uid/{uid}/health")
+    ok = status == 200 and data.get("status") == "OK"
+    return ok, data.get("message", "")
+
+
+def ensure_datasource(gf: GrafanaClient, zbx: ZabbixClient, tokenid: str) -> None:
+    status, data = gf.request("GET", f"/api/datasources/name/{DS_NAME}")
+
+    if status == 200:
+        uid = data["uid"]
+        ok, message = datasource_health(gf, uid)
+        if ok:
+            log.info("데이터소스 %s 이미 있음, health OK (%s)", DS_NAME, message)
+            return
+        log.info("데이터소스 %s health 실패 (%s). 토큰을 재발급해 갱신합니다.",
+                 DS_NAME, message)
+        token = generate_token(zbx, tokenid)
+        status, data = gf.request(
+            "PUT", f"/api/datasources/uid/{uid}", datasource_body(token)
+        )
+        if status != 200:
+            raise ApiError(f"데이터소스 갱신 실패: HTTP {status} {data.get('message', '')}")
+        log.info("데이터소스 %s 갱신", DS_NAME)
+
+    elif status == 404:
+        token = generate_token(zbx, tokenid)
+        status, data = gf.request("POST", "/api/datasources", datasource_body(token))
+        if status != 200:
+            raise ApiError(f"데이터소스 생성 실패: HTTP {status} {data.get('message', '')}")
+        uid = data["datasource"]["uid"]
+        log.info("데이터소스 %s 생성", DS_NAME)
+
+    else:
+        raise ApiError(f"데이터소스 조회 실패: HTTP {status} {data.get('message', '')}")
+
+    # 6단계 검증: 만들었거나 고쳤으면 실제로 붙는지 한 번 더 확인
+    ok, message = datasource_health(gf, uid)
+    if not ok:
+        raise ApiError(f"데이터소스 {DS_NAME} health 실패: {message}")
+    log.info("데이터소스 %s health OK (%s)", DS_NAME, message)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Zabbix/Grafana 초기 설정")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
@@ -177,6 +289,11 @@ def main() -> int:
 
     env = read_env(args.env_file)
     zbx = ZabbixClient(f"http://localhost:{env['ZBX_WEB_PORT']}/api_jsonrpc.php")
+    gf = GrafanaClient(
+        f"http://localhost:{env['GRAFANA_PORT']}",
+        "admin",
+        env["GRAFANA_ADMIN_PASSWORD"],
+    )
 
     try:
         version = zbx.call("apiinfo.version", {})
@@ -191,12 +308,16 @@ def main() -> int:
         log.info("Zabbix 설정 완료 (usrgrpid=%s, userid=%s, tokenid=%s)",
                  usrgrpid, userid, tokenid)
 
+        # token.generate 에 Admin 세션이 필요하므로 logout 전에 진행
+        enable_plugin(gf)
+        ensure_datasource(gf, zbx, tokenid)
+
         zbx.logout()
     except ApiError as e:
-        log.error("Zabbix API 오류: %s", e)
+        log.error("API 오류: %s", e)
         return 1
     except (urllib.error.URLError, TimeoutError) as e:
-        log.error("Zabbix 에 연결할 수 없습니다: %s", e)
+        log.error("연결할 수 없습니다: %s", e)
         return 1
 
     return 0
