@@ -45,7 +45,7 @@ else
 fi
 
 # 손으로 복사해 놓고 비밀번호를 안 바꾼 경우를 compose up 전에 막는다
-if grep -q change_me .env; then
+if grep -q '=change_me$' .env; then
     echo "[ERROR] .env 에 change_me 가 남아 있습니다. 값을 채운 뒤 다시 실행하세요." >&2
     exit 1
 fi

@@ -9,12 +9,16 @@ import json
 import logging
 import secrets
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 TIMEOUT = 10  # 모든 API 요청의 응답 대기 한도(초)
+WAIT_TIMEOUT = 120  # 서비스가 실제로 준비될 때까지 기다리는 최대 시간(초)
+WAIT_INTERVAL = 3  # 재시도 간격(초)
+
 ADMIN_USER = "Admin"
 ADMIN_USERID = "1"  # Zabbix 설치 시 고정
 DEFAULT_ADMIN_PASSWORD = "zabbix"  # down -v 직후의 기본값
@@ -105,12 +109,49 @@ class GrafanaClient:
                 return resp.status, json.load(resp)
         except urllib.error.HTTPError as e:
             # urllib 은 4xx/5xx 를 예외로 던진다. 여기서 잡지 않으면
-            # main 에서 연결 실패(URLError)로 잘못 처리된다
+            # main 에서 연결 실패로 잘못 처리된다
             try:
                 payload = json.load(e)
             except json.JSONDecodeError:
                 payload = {}
             return e.code, payload
+
+
+def wait_for_zabbix(zbx: ZabbixClient) -> str:
+    """zabbix-server 가 DB 스키마를 다 만들 때까지 apiinfo.version 을 재시도한다.
+
+    compose --wait 는 zabbix-web 이 응답하는 것까지만 보장한다.
+    스키마가 없으면 'Unable to select configuration' 으로 실패한다.
+    """
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    while True:
+        try:
+            return zbx.call("apiinfo.version", {})
+        except (ApiError, OSError) as e:
+            if time.monotonic() >= deadline:
+                raise
+            log.info("Zabbix 준비 대기 중 (%s)", e)
+            time.sleep(WAIT_INTERVAL)
+
+
+def wait_for_grafana(gf: GrafanaClient) -> str:
+    """Grafana 가 /api/health 에 database ok 를 줄 때까지 재시도한다.
+
+    첫 기동 때 기본 플러그인을 내려받는 동안 연결이 끊길 수 있다.
+    """
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    while True:
+        try:
+            status, data = gf.request("GET", "/api/health")
+            if status == 200 and data.get("database") == "ok":
+                return data.get("version", "")
+            reason = f"HTTP {status}"
+        except (OSError, json.JSONDecodeError) as e:
+            reason = str(e)
+        if time.monotonic() >= deadline:
+            raise ApiError(f"Grafana 가 {WAIT_TIMEOUT}초 안에 준비되지 않았습니다 ({reason})")
+        log.info("Grafana 준비 대기 중 (%s)", reason)
+        time.sleep(WAIT_INTERVAL)
 
 
 def login_admin(zbx: ZabbixClient, env: dict[str, str]) -> None:
@@ -296,7 +337,7 @@ def main() -> int:
     )
 
     try:
-        version = zbx.call("apiinfo.version", {})
+        version = wait_for_zabbix(zbx)
         log.info("Zabbix API 응답: %s", version)
         login_admin(zbx, env)
 
@@ -308,6 +349,8 @@ def main() -> int:
         log.info("Zabbix 설정 완료 (usrgrpid=%s, userid=%s, tokenid=%s)",
                  usrgrpid, userid, tokenid)
 
+        gf_version = wait_for_grafana(gf)
+        log.info("Grafana 응답: %s", gf_version)
         # token.generate 에 Admin 세션이 필요하므로 logout 전에 진행
         enable_plugin(gf)
         ensure_datasource(gf, zbx, tokenid)
@@ -316,7 +359,8 @@ def main() -> int:
     except ApiError as e:
         log.error("API 오류: %s", e)
         return 1
-    except (urllib.error.URLError, TimeoutError) as e:
+    except OSError as e:
+        # 연결 거부·끊김·타임아웃·URLError 는 전부 OSError 의 하위 클래스
         log.error("연결할 수 없습니다: %s", e)
         return 1
 
