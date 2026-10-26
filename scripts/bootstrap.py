@@ -25,6 +25,7 @@ DEFAULT_ADMIN_PASSWORD = "zabbix"  # down -v 직후의 기본값
 
 GRAFANA_NAME = "grafana"  # Zabbix 쪽 사용자 그룹·사용자·토큰 이름
 READ_HOSTGROUP = "Zabbix servers"  # grafana 가 읽을 수 있는 호스트 그룹
+SITES_GROUP = "Sites"  # 거점 그룹의 상위 그룹. Sites/<code> 하위 그룹은 권한을 물려받는다
 GRAFANA_ROLE = "User role"
 PERM_READ = 2  # 0 = 거부, 2 = 읽기 전용, 3 = 읽기·쓰기
 
@@ -187,23 +188,65 @@ def get_id(zbx: ZabbixClient, method: str, id_key: str, name: str) -> str:
     return found[0][id_key]
 
 
-def ensure_usergroup(zbx: ZabbixClient, hostgroup_id: str) -> str:
+def ensure_hostgroup(zbx: ZabbixClient, name: str) -> str:
     found = zbx.call(
-        "usergroup.get",
-        {"output": ["usrgrpid"], "filter": {"name": [GRAFANA_NAME]}},
+        "hostgroup.get",
+        {"output": ["groupid"], "filter": {"name": [name]}},
     )
     if found:
-        log.info("사용자 그룹 %s 이미 있음", GRAFANA_NAME)
-        return found[0]["usrgrpid"]
-    created = zbx.call(
-        "usergroup.create",
+        log.info("호스트 그룹 %s 이미 있음", name)
+        return found[0]["groupid"]
+    created = zbx.call("hostgroup.create", {"name": name})
+    log.info("호스트 그룹 %s 생성", name)
+    return created["groupids"][0]
+
+
+def ensure_usergroup(zbx: ZabbixClient, hostgroup_ids: list[str]) -> str:
+    """grafana 사용자 그룹. hostgroup_ids 에 읽기 권한이 없으면 추가한다.
+
+    hostgroup_rights 는 전체 교체라 기존 권한(Sites/* 상속분 포함)과 합쳐서 보낸다.
+    """
+    wanted = {gid: PERM_READ for gid in hostgroup_ids}
+    found = zbx.call(
+        "usergroup.get",
         {
-            "name": GRAFANA_NAME,
-            "hostgroup_rights": [{"id": hostgroup_id, "permission": PERM_READ}],
+            "output": ["usrgrpid"],
+            "filter": {"name": [GRAFANA_NAME]},
+            "selectHostGroupRights": "extend",
         },
     )
-    log.info("사용자 그룹 %s 생성", GRAFANA_NAME)
-    return created["usrgrpids"][0]
+    if not found:
+        created = zbx.call(
+            "usergroup.create",
+            {
+                "name": GRAFANA_NAME,
+                "hostgroup_rights": [
+                    {"id": gid, "permission": perm} for gid, perm in wanted.items()
+                ],
+            },
+        )
+        log.info("사용자 그룹 %s 생성", GRAFANA_NAME)
+        return created["usrgrpids"][0]
+
+    usrgrpid = found[0]["usrgrpid"]
+    # API 는 permission 을 문자열("2")로 준다. int 로 맞추지 않으면 매번 '다름'이 된다
+    current = {r["id"]: int(r["permission"]) for r in found[0]["hostgroup_rights"]}
+    merged = {**current, **wanted}
+    changed = [gid for gid, perm in merged.items() if current.get(gid) != perm]
+    if not changed:
+        log.info("사용자 그룹 %s 이미 있음, 권한 변경 없음", GRAFANA_NAME)
+        return usrgrpid
+    zbx.call(
+        "usergroup.update",
+        {
+            "usrgrpid": usrgrpid,
+            "hostgroup_rights": [
+                {"id": gid, "permission": perm} for gid, perm in merged.items()
+            ],
+        },
+    )
+    log.info("사용자 그룹 %s 권한 갱신 (groupid %s)", GRAFANA_NAME, ", ".join(changed))
+    return usrgrpid
 
 
 def ensure_user(zbx: ZabbixClient, usrgrpid: str, roleid: str) -> str:
@@ -342,8 +385,9 @@ def main() -> int:
         login_admin(zbx, env)
 
         hostgroup_id = get_id(zbx, "hostgroup.get", "groupid", READ_HOSTGROUP)
+        sites_id = ensure_hostgroup(zbx, SITES_GROUP)
         role_id = get_id(zbx, "role.get", "roleid", GRAFANA_ROLE)
-        usrgrpid = ensure_usergroup(zbx, hostgroup_id)
+        usrgrpid = ensure_usergroup(zbx, [hostgroup_id, sites_id])
         userid = ensure_user(zbx, usrgrpid, role_id)
         tokenid = ensure_token(zbx, userid)
         log.info("Zabbix 설정 완료 (usrgrpid=%s, userid=%s, tokenid=%s)",
