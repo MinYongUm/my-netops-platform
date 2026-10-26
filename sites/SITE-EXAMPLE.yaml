@@ -1,0 +1,25 @@
+# 사이트 프로필 예시. 가명과 사설 IP만 사용한다.
+# 실제 회사 파일은 sites/<회사>.yaml 로 만든다. sites/ 아래는 이 파일만 저장소에 올라간다.
+#
+# 규칙
+# - Zabbix 1대에는 프로필 1개만 적용한다
+# - 값은 전부 문자열로 읽힌다. NO, ON, OFF, YES 나 숫자로 시작하는 값은 따옴표로 감싼다
+# - code: 거점 코드. 파일 안에서 유일, '/' 사용 불가. Zabbix 그룹 Sites/<code> 가 된다
+# - name: 장비 이름. 파일 전체에서 유일, 영문 숫자 . - _ 만. Zabbix 호스트 이름이 된다
+# - ip:   IPv4. 파일 전체에서 유일
+# - 프로필에서 장비를 지우면 Zabbix에서 비활성된다 (감시 중지, 이력 유지)
+
+company: example
+
+sites:
+  - code: SEL
+    devices:
+      - name: SEL-CORE-01
+        ip: 10.0.0.1
+      - name: SEL-FW-01
+        ip: 10.0.0.2
+
+  - code: ICN
+    devices:
+      - name: ICN-CORE-01
+        ip: 10.1.0.1
