@@ -2,6 +2,6 @@
 .env*
 !.env.example
 
-# site profiles: real sites stay local, only the example is tracked
-sites/*.json
-!sites/SITE-EXAMPLE.json
+# site profiles: everything under sites/ stays local, only the example is tracked
+sites/*
+!sites/SITE-EXAMPLE.yaml
