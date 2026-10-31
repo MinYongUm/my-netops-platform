@@ -6,7 +6,7 @@ Issue #5의 자동화 구성 기록. 이 문서는 **실제로 저장소에 있�
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| Phase 1-A | 비밀 없는 정적 검사 CI (`.github/workflows/ci.yml`) | 구현. PR 통과·실패 각 1회 검증은 아래 "테스트 증적"에 기록 |
+| Phase 1-A | 비밀 없는 정적 검사 CI (`.github/workflows/ci.yml`) | 구현. GitHub PR 이벤트 통과 1회 확인, 실패 1회는 미검증 (아래 "테스트 증적") |
 | Phase 1-B | 봇 코멘트 전달 테스트 (`.github/workflows/bot-event-test.yml`) | 구현. **실행은 사용자 승인 후**. 결과 미판정 |
 | Phase 2 | OpenAI API 기반 PR 리뷰 (`ai-review.yml`) | 미구현. Phase 1 증거와 사용자 승인(API 계정·과금·Secret) 전에는 만들지 않는다 |
 | Phase 3 | PR → CI → AI 리뷰 → Claude Code 수정 → 재검토 E2E | 미구현 |
@@ -151,8 +151,9 @@ gh workflow run bot-event-test.yml --repo MinYongUm/my-netops-platform -f pr_num
 
 | 날짜 | 항목 | 결과 | 근거 |
 |---|---|---|---|
-| 2026-10-31 | 로컬 정적 검사 (통과·실패 시나리오) | 통과 시 exit 0, 실패 시나리오 exit 1 | Issue #5 Phase 1 PR 본문 |
-| 2026-10-31 | bot-event-test 스크립트 로컬 모의 실행 (가짜 `gh`, 네트워크 없음) | 거부 조건 5종 exit 1, 정상 1종 exit 0 | Issue #5 Phase 1 PR 본문 |
-| - | GitHub CI PR 이벤트 통과 1회 | 기록 전 | PR Checks 링크·head SHA |
-| - | GitHub CI PR 이벤트 실패 1회 | 기록 전 (사용자 승인 후 실패 커밋으로 시험) | PR Checks 링크·head SHA |
-| - | bot-event-test 실행·수신 판정 | 미실행 (사용자 승인 필요) | 실행 기록 링크, 세션 기록 |
+| 2026-10-31 | 로컬 정적 검사 (통과·실패 시나리오) | 통과 시 exit 0, 실패 시나리오 9종 exit 1. **로컬 결과이며 GitHub runner 실패 검증과 다름** | PR #6 본문 |
+| 2026-10-31 | bot-event-test 스크립트 로컬 모의 실행 (가짜 `gh`, 네트워크 없음) | 거부 조건 5종 exit 1, 정상 1종 exit 0. **GitHub 실행 아님** | PR #6 본문 |
+| 2026-10-31 | GitHub CI PR 이벤트 통과 1회 | success. `static-checks` 7개 검사 모두 `[OK]` (event `pull_request`, `BASE_SHA` `7bac73d`) | [run 41210744385](https://github.com/MinYongUm/my-netops-platform/actions/runs/41210744385), head `1c0fdfc` |
+| - | GitHub CI PR 이벤트 실패 1회 | **미검증** (사용자 승인 후 별도 실험 커밋/PR로 시험) | PR Checks 링크·head SHA |
+| - | bot-event-test GitHub 실행, `github-actions[bot]` 코멘트 게시, Claude 수신·ACK | **미실행·미검증** (`main` 병합 후, 승인된 별도 open 테스트 PR에서) | 실행 기록 링크, 세션 기록 |
+| - | `actionlint` 워크플로 문법 검사 | **미검증** (외부 바이너리 실행이 작업 환경 권한 정책으로 막힘. GitHub가 push 시 워크플로 파일 오류를 보고하지 않은 것만 확인) | - |
