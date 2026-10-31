@@ -52,7 +52,9 @@ nano .env      # ZBX_WEB_PORT, GRAFANA_PORT 변경. change_me 는 그대로 두�
 현재 `./install.sh`는 Zabbix·Grafana 설치와 초기 설정만 한다. `sites/<회사>.yaml`을 작성해도 Zabbix에 장비가 등록되지 않는다.
 
 - 프로필 형식: `sites/SITE-EXAMPLE.yaml`
-- 반영 명령은 v0.2에서 `install.sh`와 별개로 추가할 예정이다: `python3 scripts/inventory.py sites/<회사>.yaml` (`--dry-run`은 변경 없이 미리보기). 아직 파일이 없으므로 실행할 수 없다
+- 반영 명령은 v0.2에서 `install.sh`와 별개로 추가할 예정이다. **v0.2 구현 후 실행 가능**하며, 지금은 `scripts/inventory.py`가 없어 실행할 수 없다
+  - 인자는 프로필 파일 경로 1개. 실제 프로필은 구체적인 경로 또는 따옴표로 감싼 셸 변수(예: `"$PROFILE"`)로 넘긴다
+  - 반영 전에 `--dry-run`(변경 없이 미리보기)을 먼저 실행한다. 설명용 예시: `python3 scripts/inventory.py sites/SITE-EXAMPLE.yaml --dry-run`
 - v0.2는 YAML 파싱에 배포판 PyYAML을 쓸 예정이다 (Ubuntu: `sudo apt install python3-yaml`). pip 설치는 필요 없다. v0.1 설치(`./install.sh`)에는 필요 없다
 
 설계: [ARCHITECTURE.md](ARCHITECTURE.md)

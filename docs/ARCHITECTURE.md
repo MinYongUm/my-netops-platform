@@ -162,11 +162,16 @@ Zabbix API를 한 번이라도 호출하기 **전에** 프로필 전체를 검�
 
 ### 실행 방식 [결정]
 
+**v0.2 구현 후 실행 가능.** 지금은 `scripts/inventory.py`가 없어 아래 명령은 실행되지 않는다.
+
+- 인자: 프로필 파일 경로 1개. 옵션 `--dry-run`은 Zabbix를 바꾸지 않고 바뀔 내용만 출력한다
+- 설명용 예시는 공개 예제 파일과 `--dry-run`만 쓴다:
+
 ```bash
-python3 scripts/inventory.py sites/<회사>.yaml            # 반영
-python3 scripts/inventory.py sites/<회사>.yaml --dry-run  # 바뀔 내용만 출력
+python3 scripts/inventory.py sites/SITE-EXAMPLE.yaml --dry-run
 ```
 
+- 실제 프로필은 구체적인 파일 경로를 쓰거나, 경로를 셸 변수에 넣고 따옴표로 감싸 넘긴다 (예: `"$PROFILE"`). 반영 전에 같은 인자로 `--dry-run`을 먼저 실행한다
 - `install.sh`는 설치 전용으로 둔다. Inventory는 위 별도 명령으로 실행한다
 - Zabbix 인스턴스 1개에 프로필 1개만 적용한다
 - Zabbix API 공용 로직(`bootstrap.py`의 `ZabbixClient` 등)을 `scripts/zabbix_api.py`로 먼저 분리하고, 그다음 `inventory.py`를 만든다. Lesson 0-2에서 Python 표준 라이브러리로 API 클라이언트를 만든 이유가 이 재사용이다
