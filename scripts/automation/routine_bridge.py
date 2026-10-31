@@ -13,8 +13,10 @@
 켜져 있을 때의 순서:
   1. 입력 형식 검사 (PR 번호, 40자리 head SHA, 같은 PR 의 issue comment URL)
   2. GitHub API 로 PR·CI·리뷰 코멘트를 다시 조회해 검증 (입력값과 PR 본문은 믿지 않는다)
+     리뷰 마커가 result=needs_changes 일 때만 전달한다
   3. 과거 전달 기록(이 워크플로에서 forward job 이 성공한 실행)으로 같은 SHA 중복·PR당 상한 확인
-  4. /fire 1회. 재시도하지 않는다 (API 에 멱등키가 없어 재시도하면 세션이 중복 생성됨)
+  4. /fire 직전에 PR(open·base·브랜치·head SHA)을 한 번 더 조회해 확인
+  5. /fire 1회. 재시도하지 않는다 (API 에 멱등키가 없어 재시도하면 세션이 중복 생성됨)
 
 결과와 종료 코드: delivered 0, failed 1, blocked 2, disabled 3. 토큰·응답 본문·fire URL 은 출력하지 않는다.
 표준 라이브러리만 사용한다. 설계와 운영 절차: docs/ROUTINE-BRIDGE.md
@@ -51,7 +53,8 @@ LEDGER_PER_PAGE = 100
 LEDGER_MAX_CANDIDATES = 20
 
 FIRE_URL_TEMPLATE = "https://api.anthropic.com/v1/claude_code/routines/{trigger_id}/fire"
-# 2026-10-31 확인한 공식 문서 기준. anthropic-version 은 필수, beta 헤더는 있어도 없어도 받는다
+# 2026-10-31 확인. API reference 는 anthropic-version 을 필수로, Claude Code 문서는 /fire 가 beta 헤더로
+# 제공된다고 적는다 (두 문서 표현이 다름). 어느 쪽이든 통과하도록 항상 둘 다 보낸다
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_BETA = "experimental-cc-routine-2026-04-01"
 FIRE_TEXT_LIMIT = 65536
@@ -64,8 +67,13 @@ PR_NUMBER_RE = re.compile(r"^[1-9][0-9]{0,6}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TRIGGER_ID_RE = re.compile(r"^trig_[A-Za-z0-9]{1,64}$")
 SESSION_ID_RE = re.compile(r"^session_[A-Za-z0-9]{1,64}$")
-# AI 리뷰어(Issue #9)가 리뷰 코멘트에 남길 마커. 이 브리지가 정하는 인터페이스 계약
-REVIEW_MARKER_RE = re.compile(r"<!-- ai-review:v1 head=([0-9a-f]{40}) result=(completed|failed) -->")
+# AI 리뷰어(Issue #9)가 리뷰 코멘트에 남길 마커. 이 브리지가 정하는 인터페이스 계약 (초안)
+#   needs_changes: 리뷰 완료 + 수정할 지적 있음 → 전달 대상
+#   no_changes:    리뷰 완료 + 수정할 것 없음 → 전달하지 않음 (불필요한 Routine 세션 방지)
+#   failed:        리뷰 실패 → 전달하지 않음
+REVIEW_MARKER_RE = re.compile(
+    r"<!-- ai-review:v1 head=([0-9a-f]{40}) result=(needs_changes|no_changes|failed) -->"
+)
 RUN_TITLE_RE = re.compile(r"^routine-bridge pr=([1-9][0-9]{0,6}) head=([0-9a-f]{40})$")
 
 EXIT_CODES = {"delivered": 0, "failed": 1, "blocked": 2, "disabled": 3}
@@ -234,8 +242,10 @@ def verify_review(gh: GitHub, req: Request, repo: str) -> Result | None:
     marker_sha, outcome = markers[0]
     if marker_sha != req.head_sha:
         return Result("blocked", "stale-review")
-    if outcome != "completed":
+    if outcome == "failed":
         return Result("blocked", "review-failed")
+    if outcome != "needs_changes":
+        return Result("blocked", "review-no-changes")
     return None
 
 
@@ -397,6 +407,11 @@ def run_bridge(
             if stop:
                 return stop
         stop, fired = check_ledger(gh, req, repo, limit)
+        if stop:
+            return stop
+        # 위 조회 사이에 새 커밋 push·close·브랜치 변경이 있었을 수 있다 (TOCTOU).
+        # /fire 직전에 PR 을 다시 조회해 같은 조건을 확인한다. 조회 실패는 전달하지 않는다
+        stop = verify_pull(gh, req, repo)
         if stop:
             return stop
     except GitHubError:
