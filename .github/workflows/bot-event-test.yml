@@ -1,0 +1,108 @@
+# bot-event-test — GitHub Actions 봇 코멘트가 Claude Code 웹 세션에 전달되는지 확인 (Issue #5 Phase 1-B)
+#
+# - 수동 실행(workflow_dispatch)만. 사용자가 승인한 테스트 PR 번호와 확인 문구를 입력해야 실행된다
+# - 저장소 코드를 checkout 하지 않는다 (PR 코드 실행 없음). 사용자 Secret·API 키 없음
+# - 권한: pull-requests: write (코멘트 작성) 만
+# - 같은 PR 에 이 테스트 코멘트가 이미 있으면 게시하지 않고 실패로 끝낸다 (1회 제한)
+# - 절차와 결과 판정: docs/AUTOMATION.md
+name: bot-event-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "테스트 코멘트를 남길 PR 번호 (사용자가 승인한 테스트 PR만)"
+        required: true
+        type: string
+      confirm:
+        description: "실행 확인: post-bot-event-test 를 정확히 입력"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: bot-event-test
+  cancel-in-progress: false
+
+jobs:
+  post-test-comment:
+    name: post-test-comment
+    # 저장소 소유자만. 다른 사람이 실행하면 job 이 skipped 로 남는다 (성공 아님)
+    if: github.actor == github.repository_owner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post one harmless test comment
+        env:
+          # 입력값은 env 로만 넘긴다 (스크립트에 직접 끼워 넣지 않음 → 명령 주입 방지)
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          MARKER='<!-- bot-event-test -->'
+
+          if [ "$CONFIRM" != "post-bot-event-test" ]; then
+            echo "::error::confirm 입력이 'post-bot-event-test' 와 다릅니다. 게시하지 않습니다."
+            exit 1
+          fi
+          if ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]{0,6}$ ]]; then
+            echo "::error::pr_number 는 양의 정수여야 합니다."
+            exit 1
+          fi
+
+          pr=$(gh api "repos/$REPO/pulls/$PR_NUMBER")
+          state=$(jq -r '.state' <<<"$pr")
+          base_ref=$(jq -r '.base.ref' <<<"$pr")
+          head_repo=$(jq -r '.head.repo.full_name // ""' <<<"$pr")
+          head_sha=$(jq -r '.head.sha' <<<"$pr")
+          if [ "$state" != "open" ]; then
+            echo "::error::PR #$PR_NUMBER 이(가) open 상태가 아닙니다 ($state)."
+            exit 1
+          fi
+          if [ "$base_ref" != "main" ]; then
+            echo "::error::PR #$PR_NUMBER 의 base 가 main 이 아닙니다 ($base_ref)."
+            exit 1
+          fi
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::fork PR 에는 게시하지 않습니다."
+            exit 1
+          fi
+
+          existing=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\") | select(.body | contains(\"$MARKER\")) | .html_url")
+          if [ -n "$existing" ]; then
+            echo "::error::이미 테스트 코멘트가 있습니다. 중복 게시하지 않습니다: $existing"
+            exit 1
+          fi
+
+          body=$(cat <<EOF
+          $MARKER
+          <!-- bot-event-test:run=$RUN_ID -->
+          **[bot-event-test] GitHub Actions 봇 코멘트 전달 테스트 (Issue #5 Phase 1)**
+
+          이 코멘트는 \`github-actions[bot]\`이 남긴 무해한 테스트입니다. 코드·설정 변경 요청이 아닙니다.
+
+          Claude Code 세션이 이 코멘트를 사용자 메시지 없이 받았다면, 이 PR에 아래 한 줄만 답글로 남겨 주세요. 파일 수정·push는 하지 마세요.
+
+          \`bot-event-test ack run=$RUN_ID\`
+
+          - 실행 기록: $SERVER_URL/$REPO/actions/runs/$RUN_ID
+          - 게시 시점 PR head: \`$head_sha\`
+          EOF
+          )
+
+          url=$(gh api -X POST "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body" --jq '.html_url')
+          echo "게시: $url"
+          {
+            echo "### bot-event-test"
+            echo "- PR: #$PR_NUMBER (head \`$head_sha\`)"
+            echo "- 코멘트: $url"
+            echo "- 기대 응답: \`bot-event-test ack run=$RUN_ID\`"
+          } >> "$GITHUB_STEP_SUMMARY"

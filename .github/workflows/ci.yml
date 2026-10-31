@@ -1,0 +1,39 @@
+# CI — 비밀 없는 정적 검사 (Issue #5 Phase 1)
+#
+# - 권한: contents: read 만. 비밀(Secret) 사용 없음
+# - pull_request 이벤트라서 fork PR 도 읽기 전용 토큰으로 실행된다 (pull_request_target 사용 안 함)
+# - 컨테이너 기동, 회사·LAB 장비 접속 없음. 통과해도 Docker 통합 테스트 통과가 아니다
+# - 검사 내용: scripts/ci/static-checks.sh (로컬에서도 같은 명령으로 실행 가능)
+name: CI
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  static-checks:
+    name: static-checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git diff --check 의 기준 커밋이 필요
+          persist-credentials: false
+
+      - name: Static checks
+        env:
+          # PR: base 브랜치 커밋 / push: 이전 커밋 / 수동 실행: 비움(전체 트리 검사)
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+        run: bash scripts/ci/static-checks.sh
