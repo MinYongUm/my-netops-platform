@@ -220,6 +220,26 @@ class DisabledTest(NoNetwork):
         self.assertIn("전달 성공 아님", text)
 
 
+class SummaryTest(NoNetwork):
+    def test_delivered_summary_does_not_claim_more_than_session_creation(self) -> None:
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("r", suffix=".md") as f, redirect_stdout(io.StringIO()):
+            with mock.patch.object(rb, "LiveGitHub", return_value=FakeGitHub()), \
+                    mock.patch.object(rb, "live_transport", FakeTransport()):
+                code = rb.main({
+                    "ROUTINE_BRIDGE_ENABLED": "true", "CLAUDE_ROUTINE_TOKEN": FAKE_TOKEN,
+                    "CLAUDE_ROUTINE_TRIGGER_ID": TRIGGER, "BRIDGE_PR_NUMBER": PR, "BRIDGE_HEAD_SHA": SHA,
+                    "BRIDGE_REVIEW_URL": REVIEW_URL, "GITHUB_STEP_SUMMARY": f.name,
+                })
+            text = f.read()
+        self.assertEqual(code, 0)
+        self.assertIn("`delivered`", text)
+        self.assertIn("세션 생성까지만", text)
+        self.assertIn("과금 통제", text)
+        self.assertNotIn(FAKE_TOKEN, text)
+
+
 class InputTest(NoNetwork):
     """잘못된 입력·악성 입력 → GitHub 조회 전에 차단."""
 

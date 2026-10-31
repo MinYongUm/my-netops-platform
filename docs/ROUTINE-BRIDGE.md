@@ -53,12 +53,14 @@ PR (claude/ 브랜치) opened / synchronize
 
 | 결과 | exit | 의미 | Actions 표시 |
 |---|---|---|---|
-| `delivered` | 0 | `/fire`가 200 + `type: routine_fire` 응답 | 초록 |
+| `delivered` | 0 | `/fire`가 200 + `type: routine_fire` 응답 (= Routine 세션이 **생성됨**) | 초록 |
 | `failed` | 1 | 설정 오류, GitHub API 오류, `/fire` 오류·timeout | 빨강 |
 | `blocked` | 2 | 검증에서 거부 (정상적인 차단) | 빨강 |
 | `disabled` | 3 | 플래그 OFF, 토큰 없음, trigger ID 없음 | 빨강 |
 
-저장소 변수 `ROUTINE_BRIDGE_ENABLED`가 `true`가 아니면 job 자체가 **skipped**(회색)다. 초록은 `delivered`일 때만 나온다. 출력은 `routine-bridge result=… reason=…` 한 줄이다. 토큰, fire URL, trigger ID, 응답 본문은 출력하지 않는다.
+저장소 변수 `ROUTINE_BRIDGE_ENABLED`가 `true`가 아니면 job 자체가 **skipped**(회색)다. 초록은 `delivered`일 때만 나온다.
+
+**초록(`delivered`)이 뜻하지 않는 것:** Routine 세션이 작업을 끝냈다는 것, 수정이 맞다는 것, 비용이 통제됐다는 것. 세션 결과는 Routine History와 세션 기록으로, 사용량·과금은 claude.ai/settings/usage에서 따로 확인한다. Step Summary에도 같은 문구를 남긴다. 출력은 `routine-bridge result=… reason=…` 한 줄이다. 토큰, fire URL, trigger ID, 응답 본문은 출력하지 않는다.
 
 ### 설정 (환경변수)
 
@@ -141,31 +143,38 @@ Secret이나 쓰기 권한을 추가하지 않으려고 별도 저장소를 두�
 | 항목 | 내용 | 코드 반영 |
 |---|---|---|
 | 엔드포인트 | `POST https://api.anthropic.com/v1/claude_code/routines/{trig_…}/fire` | `FIRE_URL_TEMPLATE` |
-| 헤더 | API reference: `Authorization: Bearer`(Routine 전용 토큰)와 `anthropic-version` 필수, 본문이 있으면 `Content-Type: application/json`. Claude Code 문서: `/fire`는 `anthropic-beta: experimental-cc-routine-2026-04-01` 헤더로 제공되며 예시에 포함. 두 문서의 beta 헤더 표현이 다르다 (아래) | 네 헤더를 **항상 모두** 보냄. version `2023-06-01` |
+| 헤더 | **운영 기준: `Authorization: Bearer`(Routine 전용 토큰), `anthropic-version`, `anthropic-beta: experimental-cc-routine-2026-04-01`, `Content-Type: application/json`을 모두 필수로 보고 항상 보낸다.** 출처마다 beta 헤더의 필수 여부 표현이 다르다 (아래 "출처별 차이") | 네 헤더를 항상 모두 보냄. version `2023-06-01`. 테스트로 고정 |
 | 본문 | `{"text": "…"}`, 최대 65,536자. Routine에는 신뢰할 수 없는 데이터로 표시된 `<routine-fire-payload>` 블록으로 전달됨 | 길이 검사 |
 | 성공 | 200, `type: routine_fire`, 세션 ID·URL. 호출마다 **새 세션** | 세션 ID만 출력 (형식 검사 후) |
 | 오류 | 400, 401, 403, 404, 429(`Retry-After`), 500, 503 | 모두 `failed`, 재시도 없음 |
 | 멱등성 | **멱등키 없음.** 재시도하면 세션이 여러 개 생김 | 재시도 없음, 원장으로 중복 차단 |
-| 호출 횟수 한도 | 시간당: Routine당 30회(Run now 포함), 계정당 API fire 100회. 초과하면 `429`. **이 시간당 횟수 한도**에는 overage가 없다고 적혀 있음 | `429` → `failed` |
-| 사용량·비용 | 세션은 대화형 세션과 같은 **구독 사용량**을 쓴다. 구독 사용량 한도에 닿으면, usage credits가 켜진 계정은 **종량 과금(metered overage)으로 계속 실행**되고, 꺼져 있으면 거부된다 | 코드로 제어 불가. 아래 "비용 통제" |
+| 사용량·비용 (**운영 기준**) | 세션은 대화형 세션과 같은 **구독 사용량**을 쓴다. 구독 사용량 한도에 닿으면, usage credits가 켜진 계정은 **종량 과금(metered overage)으로 계속 실행**되고, 꺼져 있으면 거부된다 | 코드로 제어 불가. 아래 "비용 통제" |
+| 실행 횟수 한도 (**확정값으로 쓰지 않음**) | 계정·요금제별 실제 한도(일일 또는 시간당)는 활성화 직전에 계정 UI에서 확인한 값만 쓴다. 출처별 표기는 아래 "출처별 차이". 한도에 닿으면 `/fire`가 `429`를 돌려준다 | `429` → `failed`, 재시도 없음 |
 | 토큰 | Routine 하나만 실행 가능, 읽기 권한 없음. 웹 UI에서 한 번만 보여 줌. 재발급하면 이전 토큰 무효 | - |
 
 ### 비용 통제
 
-위 숫자는 2026-10-31 문서 기준이고 연구 미리보기라 바뀔 수 있다. 계정의 실제 한도·사용량은 문서 숫자를 믿지 말고 활성화 직전에 UI에서 확인한다.
+연구 미리보기라 한도·과금 방식이 바뀔 수 있다. **활성화 게이트:** 사용자가 실제 계정에서 남은 실행 한도(일일·시간당 중 계정에 표시되는 것)와 usage credits 설정을 확인하기 전에는 켜지 않는다.
 
 | 층 | 무엇 | 누가 |
 |---|---|---|
-| 계정 | 실제 사용량·한도 확인: claude.ai/settings/usage. **usage credits(초과 종량 과금) 켜짐 여부** 확인. 켜져 있으면 끄거나 상한을 정한 뒤 활성화 | 사용자 |
-| Anthropic 서비스 | 시간당 fire 횟수 한도 (위 표). 비용 상한이 아님 | Anthropic |
+| 계정 (주된 기준) | 실제 사용량·남은 실행 한도 확인: claude.ai/settings/usage. **usage credits(초과 종량 과금) 켜짐 여부** 확인. 켜져 있으면 끄거나 상한을 정한 뒤 활성화 | 사용자 |
+| Anthropic 서비스 | 실행 횟수 한도 (`429`). 비용 상한이 아님 | Anthropic |
 | 이 프로젝트 정책 | PR당 전달 2회(최대 3회), 같은 SHA 1회, `needs_changes`일 때만, `claude/` 브랜치만, 재시도 없음 | 이 코드 |
 
 프로젝트 정책의 횟수는 Anthropic 한도와 무관하게 이 저장소가 정한 값이다. 사용량이나 과금을 보장하지 않는다.
 
-### Issue·착수 코멘트·리뷰와 다른 점
+### 출처별 차이 (운영 기준은 위 표의 보수적인 쪽)
 
-- **beta 헤더**: 착수 코멘트와 PR 리뷰는 beta 헤더와 `anthropic-version`이 모두 필수라고 적었다. 2026-10-31에 다시 확인한 API reference의 Headers 표에는 `Authorization`·`anthropic-version`(필수)과 `Content-Type`만 있다. 그리고 beta 헤더를 보내는 기존 연동은 영향이 없으며 "있어도 없어도 받는다"고 적혀 있다. 반면 Claude Code 문서는 `/fire`가 그 beta 헤더로 제공되고, 호환되지 않는 변경은 새 날짜의 beta 헤더로 나온다고 적는다. 표현이 다르므로 코드는 **둘 다 항상 보낸다**. 어느 해석이든 통과한다.
-- **한도**: PR 리뷰는 "계정별 일일 실행 한도"를 언급했다. 2026-10-31 문서에서는 일일 한도 표현을 찾지 못했고 시간당 한도만 있었다. 어느 쪽이든 실제 값은 활성화 전에 UI에서 확인한다.
+| 항목 | 착수 코멘트·PR #12 리뷰 | Claude Code 이 세션에서 확인한 공개 문서 (2026-10-31, en·ko·API reference 3회 조회) |
+|---|---|---|
+| beta 헤더 | 모든 요청에 필수, 누락 시 400, 헤더 표에 Yes | API reference Headers 표: `Authorization`·`anthropic-version` 필수, `Content-Type` 조건부. beta 헤더는 "accepts requests with and without it". 400 원인에 beta 헤더 누락은 없음. Claude Code 문서(en·ko): `/fire`가 그 beta 헤더로 "제공된다", 예시에 포함 |
+| 실행 한도 | 계정별 일일 실행 한도(요금제별) | 시간당 한도 표(Routine당 Run now·API fire 합산 30, 계정당 API fire 100)와 "None of these hourly limits has overage". 일일 한도 표현은 찾지 못함 |
+| 종량 과금 | usage credits가 켜지면 metered overage | 같음 (구독 사용량 한도 도달 시) |
+
+두 쪽 다 공개 문서를 근거로 들었지만 내용이 다르다. 문서 판본이나 조회 시점이 다를 수 있다. 그래서 이 저장소는 어느 한쪽을 확정값으로 쓰지 않는다. 헤더는 필수로 보고 모두 보내고, 한도는 계정 UI 값으로 확인한다. 활성화 직전에 공식 문서를 다시 확인해 이 표를 갱신한다.
+
+### Issue와 다른 점
 - Issue #11은 GitHub 트리거가 PR/Release 이벤트만 지원한다고 적었다. 현재 문서에는 Issue 이벤트도 있다. PR 코멘트 이벤트는 여전히 목록에 없다.
 
 ## Routine 쪽 권고 프롬프트 (사용자가 Routine을 만들 때)

@@ -53,8 +53,8 @@ LEDGER_PER_PAGE = 100
 LEDGER_MAX_CANDIDATES = 20
 
 FIRE_URL_TEMPLATE = "https://api.anthropic.com/v1/claude_code/routines/{trigger_id}/fire"
-# 2026-10-31 확인. API reference 는 anthropic-version 을 필수로, Claude Code 문서는 /fire 가 beta 헤더로
-# 제공된다고 적는다 (두 문서 표현이 다름). 어느 쪽이든 통과하도록 항상 둘 다 보낸다
+# 운영 기준: anthropic-version 과 beta 헤더를 모두 필수로 보고 항상 보낸다.
+# 출처마다 beta 헤더의 필수 여부 표현이 다르다 (docs/ROUTINE-BRIDGE.md "출처별 차이")
 ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_BETA = "experimental-cc-routine-2026-04-01"
 FIRE_TEXT_LIMIT = 65536
@@ -475,6 +475,11 @@ def main(env: Mapping[str, str] | None = None) -> int:
             f.write(f"### routine-bridge\n- result: `{result.status}`\n- reason: `{result.reason}`\n")
             if result.status != "delivered":
                 f.write("- Claude Routine 으로 전달하지 않았다 (전달 성공 아님)\n")
+            else:
+                f.write(
+                    "- Routine 세션 생성까지만 확인했다. 세션 작업 결과·수정의 정확성·사용량/과금 통제는"
+                    " 이 job 이 보증하지 않는다 (Routine History, claude.ai/settings/usage 에서 확인)\n"
+                )
     return result.exit_code
 
 
