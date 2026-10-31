@@ -47,6 +47,7 @@ PR opened / reopened / synchronize / ready_for_review, push main, 수동 실행
 | shell-syntax | 추적 중인 `*.sh`에 `bash -n` |
 | python-compile | 추적 중인 `*.py`에 `python3 -m py_compile`. 바이트코드는 임시 디렉터리(`PYTHONPYCACHEPREFIX`)에만 생기고 저장소에 남지 않음 |
 | scanner-tests | 민감정보 검사기 단위 테스트 (`scripts/ci/test_scan_sensitive.py`) |
+| automation-tests | Routine 전달 브리지 모의 테스트 (`scripts/automation/test_routine_bridge.py`). 네트워크 연결을 막고 실행 |
 | compose-config | `.env.example`의 `change_me`를 가짜 값으로 바꾼 임시 파일로 `docker compose config --quiet`. 컨테이너를 띄우지 않고, 실제 `.env`를 읽지 않음 |
 | whitespace | `git diff --check`. PR은 base 커밋 대비, push는 이전 커밋 대비, 수동 실행은 전체 트리 |
 | forbidden-files | 추적 중인 `.env*`(`.env.example` 제외), `sites/` 아래 `SITE-EXAMPLE.yaml` 외 파일 |
@@ -74,6 +75,10 @@ BASE_SHA="$(git merge-base origin/main HEAD)" bash scripts/ci/static-checks.sh
 
 - `public-ipv4`: 공개 저장소에는 사설·문서용(`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) 주소만 쓴다. 버전 문자열 등 IP가 아닌 4자리 숫자열이 걸리면 검사기 수정은 별도 PR로 한다.
 - 검사를 끄거나 건너뛰어서 통과시키지 않는다.
+
+## routine-bridge (Phase 1-C, Issue #11)
+
+AI 리뷰 결과를 Claude Code Routine API trigger(`/fire`)로 넘기는 수동 실행 워크플로(`.github/workflows/routine-bridge.yml`)와 검증 로직(`scripts/automation/routine_bridge.py`). **기본 OFF이고 Routine 토큰 Secret을 연결하지 않아 외부 호출을 하지 않는다.** 모의 테스트만 있고 실제 전달은 미검증이다. 설계, 검증 순서, 활성화·중단 절차: [ROUTINE-BRIDGE.md](ROUTINE-BRIDGE.md)
 
 ## bot-event-test (Phase 1-B)
 
@@ -134,6 +139,7 @@ gh workflow run bot-event-test.yml --repo MinYongUm/my-netops-platform -f pr_num
 | CI를 필수 Check로 지정 (브랜치 보호 규칙) | 사용자가 직접 설정. Claude는 보호 규칙을 바꾸지 않음 |
 | OpenAI API 계정·과금, `OPENAI_API_KEY` Secret 등록 | 사용자가 승인하고 직접 설정 (Phase 2) |
 | 토큰 권한 확대, 새 Secret 추가 | 사용자 |
+| Routine 생성, API trigger 토큰 발급, `CLAUDE_ROUTINE_TOKEN` Secret 등록, 워크플로에 Secret 연결, `ROUTINE_BRIDGE_ENABLED` 변수 켜기 | 사용자. 각각 별도 승인 (Phase 1-C, [ROUTINE-BRIDGE.md](ROUTINE-BRIDGE.md)) |
 | PR 병합 | 사용자. 자동 병합 없음 |
 
 ## 실패와 재실행
