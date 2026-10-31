@@ -47,6 +47,16 @@ nano .env      # ZBX_WEB_PORT, GRAFANA_PORT 변경. change_me 는 그대로 두�
 
 `./install.sh`는 몇 번 실행해도 된다. 이미 있는 것은 건너뛴다. Grafana 데이터소스가 사라졌거나 연결이 실패하면 토큰을 재발급해 복구한다.
 
+## 사이트 프로필 반영 (v0.2, 미구현)
+
+현재 `./install.sh`는 Zabbix·Grafana 설치와 초기 설정만 한다. `sites/<회사>.yaml`을 작성해도 Zabbix에 장비가 등록되지 않는다.
+
+- 프로필 형식: `sites/SITE-EXAMPLE.yaml`
+- 반영 명령은 v0.2에서 `install.sh`와 별개의 `python3 scripts/inventory.py`로 추가할 예정이다. 아직 파일이 없으므로 실행할 수 없다
+- v0.2는 PyYAML이 필요할 예정이다. 위 요구사항의 "pip 불필요"는 현재(v0.1) 기준이다
+
+설계: [ARCHITECTURE.md](ARCHITECTURE.md)
+
 ## 중지와 삭제
 
 ```bash
