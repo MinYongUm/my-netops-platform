@@ -6,14 +6,14 @@ Issue #5의 자동화 구성 기록. 이 문서는 **실제로 저장소에 있�
 
 | 단계 | 내용 | 상태 |
 |---|---|---|
-| Phase 1-A | 비밀 없는 정적 검사 CI (`.github/workflows/ci.yml`) | 구현. GitHub PR 이벤트 통과 1회 확인, 실패 1회는 미검증 (아래 "테스트 증적") |
-| Phase 1-B | 봇 코멘트 전달 테스트 (`.github/workflows/bot-event-test.yml`) | 구현. **실행은 사용자 승인 후**. 결과 미판정 |
+| Phase 1-A | 비밀 없는 정적 검사 CI (`.github/workflows/ci.yml`) | **실제 GitHub CI 통과·실패·복구 검증 완료** (PR #7, 아래 증적) |
+| Phase 1-B | 봇 코멘트 전달 테스트 (`.github/workflows/bot-event-test.yml`) | **실제 Actions 봇 코멘트 게시 및 일치하는 Claude Code ACK 확인**. 사용자 개입 없는 이벤트 수신 자체는 GitHub만으로 독립 확인 불가 |
 | Phase 2 | OpenAI API 기반 PR 리뷰 (`ai-review.yml`) | 미구현. Phase 1 증거와 사용자 승인(API 계정·과금·Secret) 전에는 만들지 않는다 |
 | Phase 3 | PR → CI → AI 리뷰 → Claude Code 수정 → 재검토 E2E | 미구현 |
 
 Phase 2·3의 설계는 Issue #5에 있다. 여기에 복제하지 않는다.
 
-**아직 자동 수정 루프는 없다.** Phase 1-B 결과가 나오기 전에는 "봇 리뷰 → Claude Code 자동 수정"이 된다고 쓰지 않는다.
+**아직 OpenAI 자동 리뷰 및 자동 수정 루프는 없다.** Phase 1-B에서 검증된 것은 GitHub Actions 봇 코멘트 작성과 Claude Code 표시가 있는 ACK이며, 코드 수정→재검토 E2E가 아니다.
 
 ## 구성
 
@@ -154,6 +154,16 @@ gh workflow run bot-event-test.yml --repo MinYongUm/my-netops-platform -f pr_num
 | 2026-10-31 | 로컬 정적 검사 (통과·실패 시나리오) | 통과 시 exit 0, 실패 시나리오 9종 exit 1. **로컬 결과이며 GitHub runner 실패 검증과 다름** | PR #6 본문 |
 | 2026-10-31 | bot-event-test 스크립트 로컬 모의 실행 (가짜 `gh`, 네트워크 없음) | 거부 조건 5종 exit 1, 정상 1종 exit 0. **GitHub 실행 아님** | PR #6 본문 |
 | 2026-10-31 | GitHub CI PR 이벤트 통과 1회 | success. `static-checks` 7개 검사 모두 `[OK]` (event `pull_request`, `BASE_SHA` `7bac73d`) | [run 41210744385](https://github.com/MinYongUm/my-netops-platform/actions/runs/41210744385), head `1c0fdfc` |
-| - | GitHub CI PR 이벤트 실패 1회 | **미검증** (사용자 승인 후 별도 실험 커밋/PR로 시험) | PR Checks 링크·head SHA |
-| - | bot-event-test GitHub 실행, `github-actions[bot]` 코멘트 게시, Claude 수신·ACK | **미실행·미검증** (`main` 병합 후, 승인된 별도 open 테스트 PR에서) | 실행 기록 링크, 세션 기록 |
+| 2026-11-01 KST | GitHub CI PR 이벤트 실패 감지 | **failure**. 테스트용 셸 파일의 `fi` 누락을 `shell-syntax`가 감지. `main` 미변경 | [PR #7](https://github.com/MinYongUm/my-netops-platform/pull/7), [run 41214759166](https://github.com/MinYongUm/my-netops-platform/actions/runs/41214759166), head `2afece9` |
+| 2026-11-01 KST | 오류 복구 Push 후 CI 재실행 | **success**. `pull_request synchronize`로 자동 재실행 | [run 41214815996](https://github.com/MinYongUm/my-netops-platform/actions/runs/41214815996), head `dcd7a0e` |
+| 2026-11-01 KST | 봇 코멘트 실험 1차 | Actions success/봇 게시 성공. **Claude가 PR #7 구독하기 전에 게시해 수신 판정 제외** | [run 41217336332](https://github.com/MinYongUm/my-netops-platform/actions/runs/41217336332); 첫 댓글은 재시험을 위해 삭제됨 |
+| 2026-11-01 KST | 봇 코멘트 실험 2차 | Actions success. 구독 확인 이벤트의 **Claude 세션 보고 시각 이후**에 봇 게시 및 일치하는 Claude Code ACK 확인 (35초 차이). 무인 수신 여부는 GitHub 코멘트만으로 독립 증명 불가 | [run 41218619671](https://github.com/MinYongUm/my-netops-platform/actions/runs/41218619671), [봇 댓글](https://github.com/MinYongUm/my-netops-platform/pull/7#issuecomment-6545911195), [ACK](https://github.com/MinYongUm/my-netops-platform/pull/7#issuecomment-6545917484) |
 | - | `actionlint` 워크플로 문법 검사 | **미검증** (외부 바이너리 실행이 작업 환경 권한 정책으로 막힘. GitHub가 push 시 워크플로 파일 오류를 보고하지 않은 것만 확인) | - |
+
+
+### Phase 1 검증 판정 및 남은 제한 (2026-11-01 KST)
+
+- **확정:** GitHub Actions CI는 PR 오류를 감지해 실패했고, 수정 커밋에서 정상적으로 다시 실행되어 성공했다. 봇 댓글 자동 게시와 일치하는 Claude Code ACK 댓글도 실제 GitHub 기록으로 검증했다.
+- **Claude Code 이벤트 수신:** Claude 세션은 `subscription.created`를 2026-10-31 16:02:02 UTC에 수신했다고 보고했다. 재시험 봇 댓글(16:13:27 UTC)과 ACK(16:14:02 UTC)는 모두 그 이후다. 다만 GitHub 댓글 기록만으로 **별도의 사용자 메시지 없이 자동 응답했는지** 확정할 수는 없다. 필요하면 Claude 세션 이벤트 기록을 추가 증적으로 남긴다.
+- **범위 밖:** Claude가 실제 **리뷰 지적사항을 수정하고 Push → 재검토**하는 E2E는 아직 시험하지 않았다. OpenAI API 리뷰 워크플로도 미구현·미활성화 상태다.
+- **테스트 PR #7은 병합 금지:** 실험 파일을 운영 `main`에 넣지 않고 닫아 보존한다.
