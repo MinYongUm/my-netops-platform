@@ -14,16 +14,21 @@
 Zabbix `grafana` 계정은 읽기 전용이다.
 
 - 역할: User role
-- 사용자 그룹 `grafana`: `Zabbix servers` 호스트 그룹 읽기(permission 2)만
-- 검증: 이 토큰으로 `host.get` 성공, `hostgroup.create`는 `No permissions`
+- 사용자 그룹 `grafana`: 호스트 그룹 `Zabbix servers`, `Sites` 읽기(permission 2)만. `bootstrap.py`가 `Sites` 그룹을 만들고 두 권한을 설정한다
+- `Sites/<code>` 하위 그룹은 `Sites`의 권한을 물려받는다. 사용자가 제공한 과거 수동 실험 기록이 있다. 저장소에 재현 가능한 테스트는 없고 v0.2 구현 테스트에 포함한다
+- 검증 기록 (Lesson 0-2, 2026-10-19, `Sites` 추가 전): 이 토큰으로 `host.get` 성공, `hostgroup.create`는 `No permissions`
 
 Grafana에서 Admin 계정으로 Zabbix에 연결하지 않는다.
+
+### Inventory 계정 (v0.2, 미구현)
+
+계획된 `scripts/inventory.py`는 Zabbix `Admin` 계정을 재사용하는 설계다. 아직 코드가 없다. 인증 정보를 읽는 방식은 구현 때 정한다. 최소 권한 전용 계정은 검토하지 않았다 (미결).
 
 ## 비밀 보관
 
 - `.env`: 권한 600, `.gitignore`의 `.env*`로 저장소 제외 (`.env.example`만 포함)
 - Zabbix API 토큰: `.env`, compose, 디스크 어디에도 쓰지 않는다. bootstrap.py가 발급 즉시 Grafana API로 넘기고, Grafana는 `secureJsonData`로 암호화 저장한다. 조회 API는 `"apiToken": true`만 돌려준다
-- 출력 공유 시: `docker compose config | grep -v PASSWORD`. 비밀번호·토큰은 길이(`${#VAR}`)로만 확인
+- 출력 공유 시: 출력 자체를 제한하는 명령을 쓴다. 구성 검사는 `docker compose config --quiet`(출력 없이 검증만), 서비스 이름은 `docker compose config --services`. `grep -v PASSWORD` 같은 필터는 비밀이 반드시 그 이름으로 나온다는 보장이 없어 쓰지 않는다. 비밀번호·토큰은 길이(`${#VAR}`)로만 확인
 
 ## 노출되었을 때
 
@@ -50,3 +55,5 @@ Grafana에서 Admin 계정으로 Zabbix에 연결하지 않는다.
 ## 범위
 
 이 저장소의 스크립트는 Zabbix·Grafana 자체 설정만 바꾼다. 네트워크 장비에는 아무것도 하지 않는다.
+
+v0.2 inventory(미구현)가 장비를 등록하면 Zabbix 서버가 해당 IP로 ICMP Ping을 보낸다. 장비 설정은 바꾸지 않는다. 장비 대상 접근은 승인된 LAB 또는 별도 승인된 읽기 전용 범위에서만 한다. SNMP community 등 비밀 값은 사이트 프로필과 저장소에 두지 않는다 (v0.3에서 정함).
