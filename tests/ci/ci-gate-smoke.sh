@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Issue #5 Phase 1 CI failure/recovery smoke test.
-# This file is deliberately syntax-invalid for a temporary test PR only.
-# It must never be merged into main.
+# This is a temporary, non-operational test file, not intended for merge.
 if true; then
   echo 'CI smoke test'
-# Intentionally missing 'fi' so that bash -n fails.
+fi
