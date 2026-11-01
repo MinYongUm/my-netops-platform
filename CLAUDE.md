@@ -42,7 +42,7 @@
 - 필드: company / sites[].code / sites[].devices[].name / devices[].ip 만
 - code → Zabbix 그룹 Sites/<code>. 파일 안 유일(대소문자 무시), 영문·숫자·. - _ 만
 - name → Zabbix 호스트 이름 그대로. 파일 전체 유일(대소문자 무시), 영문·숫자·. - _ 만
-- ip: IPv4만, 파일 전체 유일. 0.0.0.0, 255.255.255.255, loopback, multicast 금지
+- ip: IPv4만, 파일 전체 유일. 0.0.0.0, loopback, link-local, multicast, 예약 대역(240/4, 255.255.255.255 포함) 금지
 - 모르는 키, 중복 키, 문자열이 아닌 값(YAML 1.1의 NO/ON → bool, 0으로 시작 → 숫자)은 에러
 - 앞뒤 공백이 있는 값, 빈 sites/devices, 앵커·별칭·merge key(<<)도 에러
 - 검사는 API 호출 전에 전부. 하나라도 틀리면 아무것도 바꾸지 않고 종료

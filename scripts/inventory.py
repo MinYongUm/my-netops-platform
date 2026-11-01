@@ -24,7 +24,6 @@ DEVICE_KEYS = ("name", "ip")
 # 영문·숫자·. - _ 만 허용한다 ('/' 도 여기서 막힌다)
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 MERGE_TAG = "tag:yaml.org,2002:merge"
-BROADCAST = ipaddress.IPv4Address("255.255.255.255")
 
 log = logging.getLogger("inventory")
 
@@ -190,15 +189,18 @@ def check_ip(
     except ValueError:
         errors.append(f"{path}: IPv4 주소가 아닙니다 ({value!r})")
         return None
+    # is_reserved 는 240.0.0.0/4 이고 255.255.255.255 도 여기에 들어간다
     if (
         addr.is_unspecified
         or addr.is_loopback
+        or addr.is_link_local
         or addr.is_multicast
-        or addr == BROADCAST
+        or addr.is_reserved
     ):
         errors.append(
             f"{path}: 장비 주소로 쓸 수 없는 특수 주소입니다 ({value!r}). "
-            "0.0.0.0, 255.255.255.255, 127.0.0.0/8, 224.0.0.0/4 는 금지"
+            "0.0.0.0, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, "
+            "240.0.0.0/4 는 금지"
         )
         return None
     if addr in seen:
