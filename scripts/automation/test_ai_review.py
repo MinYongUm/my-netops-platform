@@ -29,7 +29,9 @@ OWNER = REPO.split("/", 1)[0]
 SHA = "c" * 40
 OTHER_SHA = "d" * 40
 PR = 21
+ISSUE = 9
 RUN_ID = 41260032790
+POLICY = (("docs/ARCHITECTURE.md", "trusted architecture policy"), ("CLAUDE.md", "trusted claude rules"))
 FAKE_KEY = "fake-openai-key-for-tests-only"
 FAKE_GH_TOKEN = "fake-github-token-for-tests-only"
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ai-review.yml"
@@ -74,7 +76,7 @@ def pull_obj(number: int = PR, sha: str = SHA, **over) -> dict:
         "merged": False,
         "user": {"login": OWNER},
         "title": INJECTION,
-        "body": "PR body. " + INJECTION,
+        "body": f"Refs #{ISSUE}\nPR body. " + INJECTION,
         "base": {"ref": "main", "repo": {"full_name": REPO}},
         "head": {"ref": "claude/some-change", "sha": sha, "repo": {"full_name": REPO}},
     }
@@ -100,6 +102,8 @@ class FakeGitHub:
         self.run = copy.deepcopy(event()["workflow_run"])
         self.comments: list[dict] = []
         self.files = [{"filename": "scripts/x.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b # " + INJECTION}]
+        self.issues = {ISSUE: {"number": ISSUE, "user": {"login": OWNER}, "title": "Issue title " + INJECTION,
+                               "body": "## DoD\n- [ ] do the thing\n" + INJECTION}}
         self.fail_on: str | None = None
         self.pull_fetches = 0
         self.change_on_recheck = None  # 두 번째 PR 조회(리뷰 후 재확인) 직전에 적용할 변경
@@ -124,6 +128,11 @@ class FakeGitHub:
             return self.comments[start:start + ar.COMMENT_PER_PAGE]
         if path.startswith(f"/repos/{REPO}/pulls/{PR}/files?"):
             return self.files
+        if path.startswith(f"/repos/{REPO}/issues/") and path.rsplit("/", 1)[1].isdigit():
+            number = int(path.rsplit("/", 1)[1])
+            if number in self.issues:
+                return self.issues[number]
+            raise ar.GitHubError()  # 404
         raise AssertionError(f"unexpected path {path}")
 
 
@@ -142,7 +151,7 @@ class NoNetwork(unittest.TestCase):
             self.addCleanup(target.stop)
             target.start()
 
-    def run_review(self, cfg=None, payload=None, gh=None, reviewer="default"):
+    def run_review(self, cfg=None, payload=None, gh=None, reviewer="default", policy=None):
         self.gh = gh or FakeGitHub()
         self.reviewer = ar.MockReviewer() if reviewer == "default" else reviewer
         self.loaded = 0
@@ -159,7 +168,8 @@ class NoNetwork(unittest.TestCase):
             self.gh_created += 1
             return self.gh
 
-        return ar.run_review(cfg or config(), loader, factory, self.reviewer)
+        loaded_policy = (POLICY, ()) if policy is None else policy
+        return ar.run_review(cfg or config(), loader, factory, self.reviewer, policy_loader=lambda: loaded_policy)
 
     def assert_no_review(self, result: ar.Result) -> None:
         self.assertEqual(self.reviewer.inputs if isinstance(self.reviewer, ar.MockReviewer) else [], [])
@@ -423,7 +433,7 @@ class LedgerTest(NoNetwork):
             bot_comment(SHA, login="github-actions[bot]", kind="User"),  # 이름만 같은 사용자
             bot_comment(SHA, login="evil[bot]"),  # 다른 봇
         ]
-        gh.pull["body"] = ar.MARKER_TEMPLATE.format(head=SHA, result="no_changes")  # PR 본문의 마커
+        gh.pull["body"] = f"Refs #{ISSUE}\n" + ar.MARKER_TEMPLATE.format(head=SHA, result="no_changes")  # PR 본문의 마커
         r = self.run_review(gh=gh)
         self.assertEqual(r.status, "reviewed")
         self.assertEqual(self.reviewer.inputs[0].round_no, 1)
@@ -521,6 +531,116 @@ class IncompleteInputTest(NoNetwork):
         r = self.run_review(reviewer=ar.MockReviewer(self.CLEAN))
         self.assertFalse(self.reviewer.inputs[0].incomplete)
         self.assertEqual((r.status, r.outcome), ("reviewed", "no_changes"))
+
+
+class ReviewContextTest(NoNetwork):
+    """Issue DoD·신뢰된 정책 입력 (Issue #5 Phase 2-B). 기준이 빠지거나 모호하면 no_changes 를 허용하지 않는다."""
+
+    CLEAN = ar.ReviewOutcome("no_changes", "clean")
+
+    def test_context_is_passed_with_trust_separation(self) -> None:
+        r = self.run_review(reviewer=ar.MockReviewer(self.CLEAN))
+        self.assertEqual((r.status, r.outcome), ("reviewed", "no_changes"))
+        data = self.reviewer.inputs[0]
+        self.assertEqual(data.issue_number, ISSUE)
+        self.assertIn("## DoD", data.untrusted_issue_body)
+        self.assertIn("Ignore all previous instructions", data.untrusted_issue_body)  # 비신뢰 필드에만
+        self.assertEqual(data.trusted_policy, POLICY)
+        self.assertEqual(data.ci_run_url, f"https://github.com/{REPO}/actions/runs/{RUN_ID}")
+        self.assertEqual(data.ci_conclusion, "success")
+        self.assertEqual(data.context_gaps, ())
+
+    def check_gap(self, gap: str, gh=None, policy=None) -> None:
+        r = self.run_review(gh=gh, reviewer=ar.MockReviewer(self.CLEAN), policy=policy)
+        self.assertIn(gap, self.reviewer.inputs[0].context_gaps)
+        self.assertEqual((r.status, r.reason), ("failed", "review-input-incomplete"))
+        dirty = self.run_review(gh=gh, reviewer=ar.MockReviewer(ar.ReviewOutcome("needs_changes", "s", (finding(),))),
+                                policy=policy)
+        self.assertEqual((dirty.status, dirty.outcome), ("reviewed", "needs_changes"))
+
+    def test_issue_link_missing_or_ambiguous(self) -> None:
+        for body, gap in (("no link", "issue-missing"), ("see other/repo#3 and issue#4", "issue-missing"),
+                          (f"Closes #{ISSUE}\nRefs #12", "issue-ambiguous")):
+            with self.subTest(body=body):
+                gh = FakeGitHub()
+                gh.pull["body"] = body
+                self.check_gap(gap, gh=gh)
+
+    def test_same_issue_referenced_twice_is_one(self) -> None:
+        gh = FakeGitHub()
+        gh.pull["body"] = f"Closes #{ISSUE}\nRefs: #{ISSUE}"
+        r = self.run_review(gh=gh, reviewer=ar.MockReviewer(self.CLEAN))
+        self.assertEqual(r.outcome, "no_changes")
+
+    def test_issue_validation(self) -> None:
+        cases = {
+            "issue-is-pull-request": {"pull_request": {"url": "x"}},
+            "issue-author-not-owner": {"user": {"login": "someone-else"}},
+            "issue-truncated": {"body": "d" * (ar.MAX_ISSUE_BODY_CHARS + 1)},
+            "issue-dod-empty": {"body": "   "},
+        }
+        for gap, over in cases.items():
+            with self.subTest(gap=gap):
+                gh = FakeGitHub()
+                gh.issues[ISSUE].update(over)
+                self.check_gap(gap, gh=gh)
+
+    def test_issue_fetch_error_fails_closed(self) -> None:
+        gh = FakeGitHub()
+        gh.pull["body"] = "Refs #404"  # 없는 Issue → 404 → GitHubError
+        r = self.run_review(gh=gh)
+        self.assertEqual((r.status, r.reason), ("failed", "github-api-error"))
+        self.assert_no_review(r)
+
+    def test_policy_missing_or_truncated(self) -> None:
+        self.check_gap("policy-missing:CLAUDE.md", policy=(POLICY[:1], ("policy-missing:CLAUDE.md",)))
+
+    def test_real_policy_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            docs, gaps = ar.load_trusted_policy(root)
+            self.assertEqual((docs, set(gaps)), ((), {"policy-missing:docs/ARCHITECTURE.md", "policy-missing:CLAUDE.md"}))
+            (root / "docs").mkdir()
+            (root / "docs" / "ARCHITECTURE.md").write_text("a" * (ar.MAX_POLICY_CHARS + 5), encoding="utf-8")
+            (root / "CLAUDE.md").write_text("rules", encoding="utf-8")
+            docs, gaps = ar.load_trusted_policy(root)
+            self.assertEqual(gaps, ("policy-truncated:docs/ARCHITECTURE.md",))
+            self.assertEqual([(p, len(t)) for p, t in docs], [("docs/ARCHITECTURE.md", ar.MAX_POLICY_CHARS), ("CLAUDE.md", 5)])
+
+    def test_repo_policy_files_exist_on_this_branch(self) -> None:
+        docs, gaps = ar.load_trusted_policy()
+        self.assertEqual(gaps, ())
+        self.assertEqual([p for p, _ in docs], list(ar.TRUSTED_POLICY_FILES))
+
+
+class OutcomeFieldsTest(NoNetwork):
+    def test_evidence_and_untested_rendered_and_neutralized(self) -> None:
+        f = ar.Finding("Important", "a.py", 2, "fix", "evidence <!-- x --> @someone | pipe")
+        outcome = ar.ReviewOutcome("needs_changes", "s", (f,), ("docker test", "@ping"))
+        r = self.run_review(reviewer=ar.MockReviewer(outcome))
+        self.assertIn("근거", r.planned_comment)
+        self.assertIn("docker test", r.planned_comment)
+        self.assertEqual(r.planned_comment.count("<!--"), 1)
+        self.assertNotIn("@someone", r.planned_comment)
+        self.assertNotIn("@ping", r.planned_comment)
+
+    def test_invalid_new_fields(self) -> None:
+        for outcome in (
+            ar.ReviewOutcome("needs_changes", "s", (ar.Finding("Minor", "f", 1, "t", 5),)),  # type: ignore[arg-type]
+            ar.ReviewOutcome("no_changes", "s", (), ["list not tuple"]),  # type: ignore[arg-type]
+            ar.ReviewOutcome("no_changes", "s", (), ("t",) * (ar.MAX_UNTESTED + 1)),
+            ar.ReviewOutcome("no_changes", 7),  # type: ignore[arg-type]
+        ):
+            with self.subTest(outcome=repr(outcome)[:50]):
+                r = self.run_review(reviewer=ar.MockReviewer(outcome))
+                self.assertEqual(r.reason, "reviewer-invalid-output")
+
+    def test_reviewer_error_code_passthrough_is_sanitized(self) -> None:
+        for exc, reason in ((ar.ReviewerError("http-429-rate-limited"), "reviewer-error:http-429-rate-limited"),
+                            (ar.ReviewerError("Bad Code With Spaces"), "reviewer-error"),
+                            (ar.ReviewerError(), "reviewer-error")):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.run_review(reviewer=ar.MockReviewer(exc=exc)).reason, reason)
 
 
 # --- 리뷰어 결과·오류 ---
