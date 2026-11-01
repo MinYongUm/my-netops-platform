@@ -9,7 +9,7 @@
     "ask": [
       "Bash(git commit:*)",
       "Bash(./install.sh:*)",
-      "Bash(python3 scripts/inventory.py:*)"
+      "Bash(python3 scripts/inventory.py sites/:*)"
     ],
     "allow": [
       "Bash(git push)",
@@ -17,7 +17,18 @@
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)",
-      "Bash(python3 -m py_compile:*)"
+      "Bash(cat:*)",
+      "Bash(grep:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(python3 -m py_compile:*)",
+      "Bash(python3 scripts/bootstrap.py --help)",
+      "Bash(python3 scripts/inventory.py --help)",
+      "Bash(python3 scripts/inventory.py /tmp/:*)",
+      "Edit(//tmp/inventory-test/**)",
+      "Write(//tmp/inventory-test/**)"
     ]
   }
 }
