@@ -24,6 +24,8 @@ DEVICE_KEYS = ("name", "ip")
 # 영문·숫자·. - _ 만 허용한다 ('/' 도 여기서 막힌다)
 NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 MERGE_TAG = "tag:yaml.org,2002:merge"
+# "이 네트워크" 대역. is_unspecified 는 0.0.0.0 하나만 보므로 대역 전체를 따로 막는다
+THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
 
 log = logging.getLogger("inventory")
 
@@ -191,7 +193,7 @@ def check_ip(
         return None
     # is_reserved 는 240.0.0.0/4 이고 255.255.255.255 도 여기에 들어간다
     if (
-        addr.is_unspecified
+        addr in THIS_NETWORK
         or addr.is_loopback
         or addr.is_link_local
         or addr.is_multicast
@@ -199,7 +201,7 @@ def check_ip(
     ):
         errors.append(
             f"{path}: 장비 주소로 쓸 수 없는 특수 주소입니다 ({value!r}). "
-            "0.0.0.0, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, "
+            "0.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, "
             "240.0.0.0/4 는 금지"
         )
         return None
