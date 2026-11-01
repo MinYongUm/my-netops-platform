@@ -39,6 +39,7 @@ import sys
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Mapping, Protocol
 
 # --- 신뢰된 main 에 고정하는 정책 (이벤트·PR 내용으로 바꿀 수 없음) ---
@@ -61,7 +62,15 @@ MAX_PATCH_CHARS_PER_FILE = 20_000
 MAX_PATCH_CHARS_TOTAL = 100_000
 MAX_COMMENT_CHARS = 60_000
 MAX_FINDINGS = 50
+MAX_UNTESTED = 20
+MAX_ISSUE_TITLE_CHARS = 300
+MAX_ISSUE_BODY_CHARS = 20_000
+MAX_POLICY_CHARS = 40_000  # 정책 문서 1개당
 GITHUB_TIMEOUT = 10
+
+# 리뷰 기준으로 쓰는 신뢰된 정책 문서. 워크플로가 checkout 한 기본 브랜치(main)에서만 읽는다 (PR head 아님)
+TRUSTED_POLICY_FILES = ("docs/ARCHITECTURE.md", "CLAUDE.md")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # --- 형식 ---
 
@@ -71,6 +80,11 @@ SEVERITIES = ("Blocker", "Important", "Minor")
 # routine_bridge.REVIEW_MARKER_RE 와 같은 계약. 바꾸면 양쪽을 함께 바꾼다 (test_ai_review.py 가 교차 검사)
 MARKER_TEMPLATE = "<!-- ai-review:v1 head={head} result={result} -->"
 MARKER_RE = re.compile(r"<!-- ai-review:v1 head=([0-9a-f]{40}) result=(needs_changes|no_changes|failed) -->")
+# PR 본문(비신뢰)에서 같은 저장소 Issue 연결을 찾는다. 다른 저장소 참조(owner/repo#N)는 무시
+ISSUE_REF_RE = re.compile(
+    r"(?<![\w/])(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\s*:?\s+#([1-9][0-9]{0,6})\b", re.IGNORECASE
+)
+REVIEWER_ERROR_CODE_RE = re.compile(r"^[a-z0-9][a-z0-9:_-]{0,60}$")
 
 EXIT_CODES = {"reviewed": 0, "failed": 1, "blocked": 2, "disabled": 3}
 
@@ -146,11 +160,21 @@ class ReviewInput:
     untrusted_files: tuple[ChangedFile, ...]
     files_truncated: bool  # 파일 목록이 상한에 걸렸거나, 어떤 파일의 patch 가 잘렸거나 없음
     text_truncated: bool = False  # 제목·본문이 잘림
+    # 신뢰된 값 (GitHub 재조회·main checkout 에서 온다)
+    ci_run_url: str = ""
+    ci_conclusion: str = ""
+    trusted_policy: tuple[tuple[str, str], ...] = ()  # (경로, 내용). main 의 정책 문서
+    # 연결된 Issue. 번호·작성자는 검증했지만 제목·본문(DoD)은 비신뢰 데이터다
+    issue_number: int = 0
+    untrusted_issue_title: str = ""
+    untrusted_issue_body: str = ""
+    # 리뷰 기준이 빠졌거나 모호함 (issue-missing, policy-missing:CLAUDE.md 등)
+    context_gaps: tuple[str, ...] = ()
 
     @property
     def incomplete(self) -> bool:
-        """리뷰어가 변경 전체를 보지 못했다. 이 경우 no_changes(깨끗함) 판정을 허용하지 않는다."""
-        return self.files_truncated or self.text_truncated
+        """리뷰어가 변경 전체나 리뷰 기준을 보지 못했다. 이 경우 no_changes(깨끗함) 판정을 허용하지 않는다."""
+        return self.files_truncated or self.text_truncated or bool(self.context_gaps)
 
 
 @dataclass(frozen=True)
@@ -159,6 +183,7 @@ class Finding:
     file: str
     line: int
     text: str
+    evidence: str = ""  # 근거 (diff·정책·DoD 중 어디서 확인했는지)
 
 
 @dataclass(frozen=True)
@@ -166,6 +191,7 @@ class ReviewOutcome:
     result: str  # needs_changes | no_changes
     summary: str
     findings: tuple[Finding, ...] = ()
+    untested: tuple[str, ...] = ()  # 리뷰어가 확인하지 못한 테스트·검증
 
 
 class Reviewer(Protocol):
@@ -173,7 +199,11 @@ class Reviewer(Protocol):
 
 
 class ReviewerError(Exception):
-    """리뷰어(모델 API 등) 실패. 메시지는 출력하지 않는다."""
+    """리뷰어(모델 API 등) 실패. code 는 결과 사유에 남기는 짧은 식별자이고, 그 밖의 내용은 출력하지 않는다."""
+
+    def __init__(self, code: str = "") -> None:
+        super().__init__(code)
+        self.code = code if REVIEWER_ERROR_CODE_RE.fullmatch(code or "") else ""
 
 
 class GitHub(Protocol):
@@ -376,8 +406,57 @@ def _cap(text: object, limit: int) -> tuple[str, bool]:
     return (value[:limit], True) if len(value) > limit else (value, False)
 
 
+def resolve_issue(gh: GitHub, pr_body: str, repo: str) -> tuple[int, str, str, tuple[str, ...]]:
+    """PR 본문에서 같은 저장소 Issue 연결을 정확히 1개 찾는다. (번호, 제목, 본문, 누락 사유).
+
+    추정하지 않는다: 연결이 없거나 여러 개이거나 검증에 실패하면 번호 0 과 사유를 돌려준다 (리뷰는 불완전 처리).
+    """
+    numbers = sorted({int(n) for n in ISSUE_REF_RE.findall(pr_body or "")})
+    if not numbers:
+        return 0, "", "", ("issue-missing",)
+    if len(numbers) > 1:
+        return 0, "", "", ("issue-ambiguous",)
+    issue = gh.get(f"/repos/{repo}/issues/{numbers[0]}")
+    if not isinstance(issue, dict):
+        raise GitHubError()
+    if "pull_request" in issue:
+        return 0, "", "", ("issue-is-pull-request",)
+    if (issue.get("user") or {}).get("login") != repo.split("/", 1)[0]:
+        return 0, "", "", ("issue-author-not-owner",)
+    title, title_cut = _cap(issue.get("title"), MAX_ISSUE_TITLE_CHARS)
+    body, body_cut = _cap(issue.get("body"), MAX_ISSUE_BODY_CHARS)
+    gaps = ("issue-truncated",) if (title_cut or body_cut) else ()
+    if not body.strip():
+        gaps += ("issue-dod-empty",)
+    return numbers[0], title, body, gaps
+
+
+PolicyLoader = Callable[[], "tuple[tuple[tuple[str, str], ...], tuple[str, ...]]"]
+
+
+def load_trusted_policy(root: Path = REPO_ROOT) -> tuple[tuple[tuple[str, str], ...], tuple[str, ...]]:
+    """main checkout 의 정책 문서를 읽는다. ((경로, 내용)..., 누락 사유...)."""
+    docs = []
+    gaps = []
+    for rel in TRUSTED_POLICY_FILES:
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            gaps.append(f"policy-missing:{rel}")
+            continue
+        if not text.strip():
+            gaps.append(f"policy-missing:{rel}")
+            continue
+        text, cut = _cap(text, MAX_POLICY_CHARS)
+        if cut:
+            gaps.append(f"policy-truncated:{rel}")
+        docs.append((rel, text))
+    return tuple(docs), tuple(gaps)
+
+
 def build_review_input(gh: GitHub, pull: dict, number: int, head_sha: str, repo: str,
-                       round_no: int, limit: int) -> ReviewInput:
+                       round_no: int, limit: int, ci_run_url: str = "",
+                       policy: tuple[tuple[tuple[str, str], ...], tuple[str, ...]] = ((), ())) -> ReviewInput:
     query = urllib.parse.urlencode({"per_page": FILES_PER_PAGE, "page": 1})
     raw_files = gh.get(f"/repos/{repo}/pulls/{number}/files?{query}")
     if not isinstance(raw_files, list):
@@ -399,8 +478,18 @@ def build_review_input(gh: GitHub, pull: dict, number: int, head_sha: str, repo:
         files.append(ChangedFile(_cap(item.get("filename"), 300)[0], _cap(item.get("status"), 20)[0], patch, cut))
     title, title_cut = _cap(pull.get("title"), MAX_TITLE_CHARS)
     body, body_cut = _cap(pull.get("body"), MAX_BODY_CHARS)
-    return ReviewInput(repo, number, head_sha, round_no, limit, title, body, tuple(files), truncated_any,
-                       title_cut or body_cut)
+    issue_number, issue_title, issue_body, issue_gaps = resolve_issue(gh, pull.get("body") or "", repo)
+    policy_docs, policy_gaps = policy
+    return ReviewInput(
+        repo, number, head_sha, round_no, limit, title, body, tuple(files), truncated_any, title_cut or body_cut,
+        ci_run_url=ci_run_url,
+        ci_conclusion="success",  # verify_ci_run 이 확인한 값
+        trusted_policy=policy_docs,
+        issue_number=issue_number,
+        untrusted_issue_title=issue_title,
+        untrusted_issue_body=issue_body,
+        context_gaps=issue_gaps + policy_gaps,
+    )
 
 
 # --- 6. 리뷰어 결과 검사 ---
@@ -417,6 +506,14 @@ def validate_outcome(outcome: object) -> ReviewOutcome | None:
             return None
         if not isinstance(f.line, int) or isinstance(f.line, bool) or f.line < 0:
             return None
+        if not all(isinstance(v, str) for v in (f.file, f.text, f.evidence)):
+            return None
+    if not isinstance(outcome.summary, str):
+        return None
+    if not isinstance(outcome.untested, tuple) or len(outcome.untested) > MAX_UNTESTED:
+        return None
+    if not all(isinstance(t, str) for t in outcome.untested):
+        return None
     serious = any(f.severity in ("Blocker", "Important") for f in outcome.findings)
     if outcome.result == "needs_changes" and not outcome.findings:
         return None  # 고칠 것이 없는데 수정 요청
@@ -450,10 +547,15 @@ def render_comment(repo: str, number: int, head_sha: str, run_id: int, round_no:
     elif outcome is not None:
         lines += ["", neutralize(outcome.summary)]
         if outcome.findings:
-            lines += ["", "| 심각도 | 파일 | 줄 | 내용 |", "|---|---|---|---|"]
+            lines += ["", "| 심각도 | 파일 | 줄 | 내용 | 근거 |", "|---|---|---|---|---|"]
             for f in outcome.findings:
                 text = neutralize(f.text).replace("|", "\\|")
-                lines.append(f"| {f.severity} | `{neutralize(f.file, 300).replace('`', '')}` | {f.line} | {text} |")
+                evidence = neutralize(f.evidence, 500).replace("|", "\\|")
+                path = neutralize(f.file, 300).replace("`", "")
+                lines.append(f"| {f.severity} | `{path}` | {f.line} | {text} | {evidence} |")
+        if outcome.untested:
+            lines += ["", "확인하지 못한 테스트·검증:"]
+            lines += [f"- {neutralize(t, 300)}" for t in outcome.untested]
     lines += ["", "_이 코멘트는 자동 리뷰 결과이며 승인·병합 결정이 아니다._"]
     body = "\n".join(lines)
     return body[:MAX_COMMENT_CHARS]
@@ -468,6 +570,7 @@ def run_review(
     gh_factory: Callable[[], GitHub],
     reviewer: Reviewer | None,
     repo: str = TRUSTED_REPO,
+    policy_loader: PolicyLoader = load_trusted_policy,
 ) -> Result:
     off = check_config(config, reviewer)
     if off:
@@ -499,7 +602,8 @@ def run_review(
         if stop:
             return stop
         round_no = done + 1
-        data = build_review_input(gh, pull, number, ev.head_sha, repo, round_no, limit)
+        ci_url = f"https://github.com/{repo}/actions/runs/{ev.run_id}"
+        data = build_review_input(gh, pull, number, ev.head_sha, repo, round_no, limit, ci_url, policy_loader())
     except GitHubError:
         return Result("failed", "github-api-error")
 
@@ -511,6 +615,8 @@ def run_review(
         raw = reviewer.review(data)
     except TimeoutError:
         return failed("reviewer-timeout")
+    except ReviewerError as exc:
+        return failed(f"reviewer-error:{exc.code}" if exc.code else "reviewer-error")
     except Exception:  # noqa: BLE001 — 리뷰어 오류는 종류와 관계없이 실패로 닫는다. 메시지는 출력하지 않는다
         return failed("reviewer-error")
     outcome = validate_outcome(raw)
