@@ -10,7 +10,7 @@
 - 비밀번호·토큰을 출력이나 로그에 남기지 않는다. 확인이 필요하면 길이만 출력한다
 - 회사명, 실제 장비 IP, 계정, config는 코드·예시·커밋에 넣지 않는다. 예시는 가명·사설 IP만
 - 운영망 대상 코드는 읽기 전용(show, 읽기 API)만
-- git push, docker compose down -v는 실행하지 않는다 (사용자가 직접)
+- docker compose down -v, git tag 생성, 강제 push는 하지 않는다 (사용자가 직접)
 
 ## 코드 규칙
 - Python 3.12, 표준 라이브러리(urllib, json) + python3-yaml(apt)만 사용. pip 패키지 추가 금지
@@ -63,5 +63,18 @@
 
 ## 역할 분담
 - Claude Code: 코드 작성·수정, 검증 명령 실행, 커밋 메시지 작성
-- 사용자: plan 승인, git diff 검토, 커밋 승인, push, 운영망 관련 판단
+- 사용자: plan 승인, 커밋 승인(승인되면 Claude Code가 이어서 push), 설계 결정, 운영망 관련 판단
 - 설계 결정은 사용자와 별도로 정한다. 정해지지 않은 설계는 코드로 먼저 정하지 말고 묻는다
+
+## 작업 규칙
+- 파일 수정은 Edit 도구로 한다. python3 - <<EOF, sed 등 셸로 파일을 다시 쓰지 않는다
+- 큰 블록 삭제는 블록마다 따로 Edit한다
+- git add는 파일을 지정한다. git add -A, git add . 금지
+- 커밋은 git commit과 git push를 한 명령으로 묶어 승인 한 번에 끝낸다
+- 검증 순서: py_compile → --help(실제 import 확인) → 동작 확인(install.sh 또는 대상 스크립트)
+- 테스트용 파일은 /tmp에 만든다. sites/ 아래에 만들지 않는다
+- 커밋 전에 reviewer 서브에이전트로 diff를 검토받는다
+
+## 결정 처리
+- 설계(CLAUDE.md, docs/)에 없는 결정이 필요하면 구현을 멈추고 사용자에게 선택지와 추천을 묻는다
+- 사용자가 결정하면 docs/DECISIONS.md 맨 아래에 날짜, 결정, 이유를 한 줄씩 추가하고 같은 커밋에 넣는다
