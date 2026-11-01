@@ -102,7 +102,7 @@ CI가 성공한 PR을 AI로 리뷰하기 위한 워크플로(`.github/workflows/
 4. CI run 재조회: 같은 run이 여전히 success이고 같은 SHA·워크플로·이벤트인지
 5. 리뷰 기록: `github-actions[bot]` 코멘트의 마커만 센다 (사람·다른 봇·PR 본문의 마커는 무시). 같은 SHA는 결과와 관계없이 다시 리뷰하지 않음. PR당 상한 기본 2회, `AI_REVIEW_MAX_ROUNDS`로 최대 3회. `failed`도 1회로 센다
 6. 리뷰 입력: PR 제목·본문·변경 파일은 `untrusted_*` 필드에 **데이터로만** 담고 크기를 자른다 (본문 2만 자, 파일당 2만 자, 전체 10만 자, 파일 100개)
-7. 리뷰어 1회 호출. 시간 초과·오류·형식 위반(`needs_changes`인데 지적 없음, `no_changes`인데 Blocker·Important 있음 등)은 `failed`
+7. 리뷰어 1회 호출. 시간 초과·오류·형식 위반(`needs_changes`인데 지적 없음, `no_changes`인데 Blocker·Important 있음 등)은 `failed`. 입력이 불완전하면(파일 목록 상한, patch 잘림·생략, 제목·본문 잘림) `no_changes`를 허용하지 않고 `failed`(`review-input-incomplete`)
 8. 리뷰 후 PR 재조회 (TOCTOU): head가 바뀌었거나 닫혔으면 결과를 버린다
 9. 게시 예정 코멘트: 첫 줄 마커 + 결과. 리뷰어·PR에서 온 문자열의 `<!--`, `-->`, `@`는 무력화
 
@@ -121,12 +121,14 @@ CI가 성공한 PR을 AI로 리뷰하기 위한 워크플로(`.github/workflows/
 - CI 성공은 **그 PR 브랜치의 `ci.yml`** 기준이다. 같은 저장소 PR은 `ci.yml`을 바꿀 수 있으므로, 작성자를 저장소 소유자로 제한하는 것이 신뢰의 근거다.
 - 기록(중복·상한)은 PR 코멘트에 의존한다. 코멘트 게시가 없는 현재 버전에서는 실제로 쌓이지 않는다. 사람이 봇 코멘트를 지우면 상한이 풀린다.
 - 비용 상한은 이 워크플로의 PR당 횟수 제한만으로 강제되지 않는다. 실제 활성화 전에 모델 API 계정·프로젝트의 사용량/예산 한도를 함께 설정해야 한다 (Issue #9).
+- 리뷰 입력에는 아직 **연결된 Issue의 DoD와 신뢰된 정책(`docs/ARCHITECTURE.md`, `CLAUDE.md`, `main` 기준)**이 없다. 지금은 PR 제목·본문·변경 파일(비신뢰)만 담는 모의 계약이다. 실제 리뷰어를 구현할 때 이 입력을 신뢰된 `main`에서 읽어 추가해야 하며, PR 본문을 모델 지시문으로 쓰지 않는다.
+- `workflow_run` OFF 경로(`review` job skipped, 외부 호출·코멘트 0회)는 이 파일이 `main`에 병합된 뒤의 첫 성공 CI 이벤트에서 GitHub runner로 확인해야 한다. 그 전까지는 미검증.
 
 ### 실제 활성화 전에 필요한 것 (모두 사용자 승인, 각각 별도 PR)
 
 1. 모델 API(OpenAI 등) 사용·과금·모델 선택과 계정 예산 한도
 2. `OPENAI_API_KEY` Secret 등록과 워크플로 연결
-3. 실제 리뷰어 구현 (네트워크 호출)
+3. 실제 리뷰어 구현 (네트워크 호출). 리뷰 입력에 Issue DoD와 신뢰된 정책 문서 추가
 4. 코멘트 게시: `pull-requests: write`를 **리뷰 job과 분리된 job**에서만
 5. `AI_REVIEW_ENABLED` 변수 켜기
 6. Phase 3: 리뷰 → Claude 수정 → 재검토 E2E 실험

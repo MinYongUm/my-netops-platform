@@ -20,7 +20,8 @@
   4. CI run 재조회: 같은 run 이 아직 completed·success 이고 같은 SHA·같은 워크플로인지
   5. 리뷰 기록(github-actions[bot] 코멘트의 ai-review 마커): 같은 SHA 중복 금지, PR 당 상한(기본 2, 최대 3)
   6. 리뷰 입력 구성: PR 제목·본문·변경 파일은 비신뢰 데이터로만 담는다
-  7. 리뷰어 호출 1회. 시간 초과·오류·형식 위반은 failed
+  7. 리뷰어 호출 1회. 시간 초과·오류·형식 위반은 failed.
+     입력이 잘렸거나 patch 가 없는 파일이 있으면 no_changes 를 허용하지 않고 failed (review-input-incomplete)
   8. 리뷰 후 PR 재조회(TOCTOU): head 가 바뀌었거나 닫혔으면 결과를 버린다
   9. 게시 예정 코멘트 생성. 마커 형식은 routine_bridge.py 의 계약과 같다:
      <!-- ai-review:v1 head=<40hex> result=needs_changes|no_changes|failed -->
@@ -143,7 +144,13 @@ class ReviewInput:
     untrusted_title: str
     untrusted_body: str
     untrusted_files: tuple[ChangedFile, ...]
-    files_truncated: bool
+    files_truncated: bool  # 파일 목록이 상한에 걸렸거나, 어떤 파일의 patch 가 잘렸거나 없음
+    text_truncated: bool = False  # 제목·본문이 잘림
+
+    @property
+    def incomplete(self) -> bool:
+        """리뷰어가 변경 전체를 보지 못했다. 이 경우 no_changes(깨끗함) 판정을 허용하지 않는다."""
+        return self.files_truncated or self.text_truncated
 
 
 @dataclass(frozen=True)
@@ -382,15 +389,18 @@ def build_review_input(gh: GitHub, pull: dict, number: int, head_sha: str, repo:
         if not isinstance(item, dict):
             continue
         patch, cut = _cap(item.get("patch"), MAX_PATCH_CHARS_PER_FILE)
+        if not isinstance(item.get("patch"), str):
+            cut = True  # GitHub 가 patch 를 생략함 (큰 diff·바이너리) → 리뷰어가 내용을 못 봄
         room = MAX_PATCH_CHARS_TOTAL - total
         if len(patch) > room:
             patch, cut = patch[:max(room, 0)], True
         total += len(patch)
         truncated_any = truncated_any or cut
         files.append(ChangedFile(_cap(item.get("filename"), 300)[0], _cap(item.get("status"), 20)[0], patch, cut))
-    title, _ = _cap(pull.get("title"), MAX_TITLE_CHARS)
-    body, _ = _cap(pull.get("body"), MAX_BODY_CHARS)
-    return ReviewInput(repo, number, head_sha, round_no, limit, title, body, tuple(files), truncated_any)
+    title, title_cut = _cap(pull.get("title"), MAX_TITLE_CHARS)
+    body, body_cut = _cap(pull.get("body"), MAX_BODY_CHARS)
+    return ReviewInput(repo, number, head_sha, round_no, limit, title, body, tuple(files), truncated_any,
+                       title_cut or body_cut)
 
 
 # --- 6. 리뷰어 결과 검사 ---
@@ -506,6 +516,9 @@ def run_review(
     outcome = validate_outcome(raw)
     if outcome is None:
         return failed("reviewer-invalid-output")
+    if data.incomplete and outcome.result == "no_changes":
+        # 일부만 본 리뷰를 "수정 불필요"로 게시하지 않는다 (needs_changes 는 본 부분의 지적이므로 유지)
+        return failed("review-input-incomplete")
 
     # 리뷰하는 동안 새 커밋 push·close 가 있었을 수 있다 (TOCTOU). 오래된 SHA 의 결과는 버린다
     try:

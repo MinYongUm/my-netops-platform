@@ -482,6 +482,47 @@ class InjectionTest(NoNetwork):
         self.assertTrue(all(f.truncated for f in data.untrusted_files))
 
 
+class IncompleteInputTest(NoNetwork):
+    """리뷰어가 변경 전체를 보지 못했으면 no_changes(깨끗함)를 허용하지 않는다 (PR #14 리뷰 1번)."""
+
+    CLEAN = ar.ReviewOutcome("no_changes", "looks clean")
+    DIRTY = ar.ReviewOutcome("needs_changes", "s", (finding(),))
+
+    def cases(self) -> dict:
+        big_file = {"filename": "big.py", "status": "modified", "patch": "z" * (ar.MAX_PATCH_CHARS_PER_FILE + 1)}
+        return {
+            "file-list-at-limit": lambda g: setattr(g, "files", [dict(g.files[0], filename=f"f{i}")
+                                                                  for i in range(ar.FILES_PER_PAGE)]),
+            "patch-truncated": lambda g: setattr(g, "files", [big_file]),
+            "patch-missing": lambda g: setattr(g, "files", [{"filename": "bin.png", "status": "added"}]),
+            "body-truncated": lambda g: g.pull.update(body="b" * (ar.MAX_BODY_CHARS + 1)),
+            "title-truncated": lambda g: g.pull.update(title="t" * (ar.MAX_TITLE_CHARS + 1)),
+        }
+
+    def test_no_changes_rejected_when_incomplete(self) -> None:
+        for name, change in self.cases().items():
+            with self.subTest(case=name):
+                gh = FakeGitHub()
+                change(gh)
+                r = self.run_review(gh=gh, reviewer=ar.MockReviewer(self.CLEAN))
+                self.assertTrue(self.reviewer.inputs[0].incomplete)
+                self.assertEqual((r.status, r.reason, r.outcome), ("failed", "review-input-incomplete", "failed"))
+                self.assertEqual(rb.REVIEW_MARKER_RE.findall(r.planned_comment), [(SHA, "failed")])
+
+    def test_needs_changes_kept_when_incomplete(self) -> None:
+        for name, change in self.cases().items():
+            with self.subTest(case=name):
+                gh = FakeGitHub()
+                change(gh)
+                r = self.run_review(gh=gh, reviewer=ar.MockReviewer(self.DIRTY))
+                self.assertEqual((r.status, r.outcome), ("reviewed", "needs_changes"))
+
+    def test_complete_input_allows_no_changes(self) -> None:
+        r = self.run_review(reviewer=ar.MockReviewer(self.CLEAN))
+        self.assertFalse(self.reviewer.inputs[0].incomplete)
+        self.assertEqual((r.status, r.outcome), ("reviewed", "no_changes"))
+
+
 # --- 리뷰어 결과·오류 ---
 
 
