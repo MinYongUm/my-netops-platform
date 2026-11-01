@@ -5,3 +5,5 @@
 # site profiles: everything under sites/ stays local, only the example is tracked
 sites/*
 !sites/SITE-EXAMPLE.yaml
+.claude/settings.local.json
+__pycache__/
