@@ -70,6 +70,10 @@ GITHUB_TIMEOUT = 10
 
 # 리뷰 기준으로 쓰는 신뢰된 정책 문서. 워크플로가 checkout 한 기본 브랜치(main)에서만 읽는다 (PR head 아님)
 TRUSTED_POLICY_FILES = ("docs/ARCHITECTURE.md", "CLAUDE.md")
+# PR 이 이 경로를 바꾸면 자동 리뷰하지 않는다 (수동 검토). CI 정의·검증 스크립트·리뷰 파이프라인 자체를
+# PR 이 바꾼 경우, "CI 성공" 이 신뢰된 main 의 검사를 실행했다는 보장이 없기 때문이다
+PROTECTED_PATH_PREFIXES = (".github/", "scripts/ci/", "scripts/automation/")
+PROTECTED_FILES_MAX_PAGES = 10
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # --- 형식 ---
@@ -346,8 +350,12 @@ def verify_pull(gh: GitHub, number: int, head_sha: str, repo: str) -> dict | Res
     return pull
 
 
-def verify_ci_run(gh: GitHub, ev: Event, repo: str) -> Result | None:
-    """이벤트 값 대신 run 을 다시 조회한다 (re-run 으로 결과가 바뀌었을 수 있다)."""
+def verify_ci_run(gh: GitHub, ev: Event, repo: str, number: int = 0) -> Result | None:
+    """이벤트 값 대신 run 을 다시 조회한다 (re-run 으로 결과가 바뀌었을 수 있다).
+
+    run 이 기본 브랜치에 등록된 ci.yml 워크플로(같은 workflow id)의 것인지, 대상 PR 에 연결된 run 인지도 확인한다.
+    PR 이 ci.yml 내용을 바꾼 경우는 workflow id 가 같으므로 여기서 막을 수 없다 → check_protected_paths 가 막는다.
+    """
     run = gh.get(f"/repos/{repo}/actions/runs/{ev.run_id}")
     if not isinstance(run, dict):
         return Result("failed", "github-unexpected-response")
@@ -360,7 +368,36 @@ def verify_ci_run(gh: GitHub, ev: Event, repo: str) -> Result | None:
         return Result("blocked", "ci-run-mismatch")
     if run.get("status") != "completed" or run.get("conclusion") != "success":
         return Result("blocked", "ci-not-success")
+    workflow = gh.get(f"/repos/{repo}/actions/workflows/{CI_WORKFLOW_PATH.rsplit('/', 1)[1]}")
+    if not isinstance(workflow, dict) or workflow.get("path") != CI_WORKFLOW_PATH:
+        return Result("failed", "github-unexpected-response")
+    wid = workflow.get("id")
+    if not isinstance(wid, int) or isinstance(wid, bool) or run.get("workflow_id") != wid:
+        return Result("blocked", "ci-workflow-not-trusted")
+    if number:
+        linked = {p.get("number") for p in run.get("pull_requests") or [] if isinstance(p, dict)}
+        if number not in linked:
+            return Result("blocked", "ci-run-pr-unlinked")
     return None
+
+
+def check_protected_paths(gh: GitHub, number: int, repo: str) -> Result | None:
+    """PR 의 변경 파일 전체(이름 변경 전 경로 포함)를 보고, 보호 경로를 건드리면 자동 리뷰를 막는다."""
+    for page in range(1, PROTECTED_FILES_MAX_PAGES + 1):
+        query = urllib.parse.urlencode({"per_page": FILES_PER_PAGE, "page": page})
+        batch = gh.get(f"/repos/{repo}/pulls/{number}/files?{query}")
+        if not isinstance(batch, list):
+            raise GitHubError()
+        for item in batch:
+            if not isinstance(item, dict):
+                return Result("failed", "github-unexpected-response")
+            for key in ("filename", "previous_filename"):
+                path = item.get(key)
+                if isinstance(path, str) and path.startswith(PROTECTED_PATH_PREFIXES):
+                    return Result("blocked", "manual-review-required:protected-path")
+        if len(batch) < FILES_PER_PAGE:
+            return None
+    return Result("blocked", "files-unverifiable")  # 파일이 너무 많아 다 확인하지 못함
 
 
 # --- 4. 리뷰 기록 (중복·상한) ---
@@ -564,20 +601,44 @@ def render_comment(repo: str, number: int, head_sha: str, run_id: int, round_no:
 # --- 전체 흐름 ---
 
 
-def run_review(
+@dataclass(frozen=True)
+class Prepared:
+    """prepare_review 의 결과. 모델 키 없이 만들 수 있고, finish_review 가 이것만으로 리뷰를 마친다."""
+
+    data: ReviewInput
+    run_id: int
+    round_no: int
+    limit: int
+
+
+# 추가 검사 (예: review_pipeline 의 실행 기록 상한). (gh, Event, PR 번호, limit) -> 막을 때 Result
+ExtraCheck = Callable[[GitHub, Event, int, int], "Result | None"]
+
+
+def check_gate(config: Config) -> Result | None:
+    """준비 단계의 설정 검사. 모델 키·리뷰어는 보지 않는다 (준비 단계에는 키가 없다)."""
+    if not config.enabled:
+        return Result("disabled", "flag-off")
+    if max_rounds(config) is None:
+        return Result("failed", "config-invalid:max-rounds")
+    if not config.github_token:
+        return Result("failed", "no-github-token")
+    return None
+
+
+def prepare_review(
     config: Config,
     event_loader: Callable[[], object],
     gh_factory: Callable[[], GitHub],
-    reviewer: Reviewer | None,
     repo: str = TRUSTED_REPO,
     policy_loader: PolicyLoader = load_trusted_policy,
-) -> Result:
-    off = check_config(config, reviewer)
+    extra_checks: tuple[ExtraCheck, ...] = (),
+    gh: GitHub | None = None,
+) -> Prepared | Result:
+    """모델 호출 전까지의 모든 검증. 통과하면 Prepared, 아니면 멈춘 이유(Result)."""
+    off = check_gate(config)
     if off:
         return off  # 이벤트 파일도 읽지 않고, GitHub 클라이언트도 만들지 않는다
-    if reviewer is None:  # check_config 가 이미 막지만, 최적화 실행(-O)에서도 확실히 닫는다
-        return Result("disabled", "reviewer-not-implemented")
-
     try:
         payload = event_loader()
     except (OSError, ValueError):
@@ -586,7 +647,7 @@ def run_review(
     if isinstance(ev, Result):
         return ev
 
-    gh = gh_factory()
+    gh = gh or gh_factory()
     limit = max_rounds(config) or DEFAULT_MAX_ROUNDS
     try:
         number = resolve_pull(gh, ev, repo)
@@ -595,21 +656,32 @@ def run_review(
         pull = verify_pull(gh, number, ev.head_sha, repo)
         if isinstance(pull, Result):
             return pull
-        stop = verify_ci_run(gh, ev, repo)
+        stop = verify_ci_run(gh, ev, repo, number) or check_protected_paths(gh, number, repo)
         if stop:
             return stop
         stop, done = check_ledger(gh, number, ev.head_sha, repo, limit)
         if stop:
             return stop
+        for check in extra_checks:
+            stop = check(gh, ev, number, limit)
+            if stop:
+                return stop
         round_no = done + 1
         ci_url = f"https://github.com/{repo}/actions/runs/{ev.run_id}"
         data = build_review_input(gh, pull, number, ev.head_sha, repo, round_no, limit, ci_url, policy_loader())
     except GitHubError:
         return Result("failed", "github-api-error")
+    return Prepared(data, ev.run_id, round_no, limit)
+
+
+def finish_review(prepared: Prepared, reviewer: Reviewer, gh: GitHub, repo: str = TRUSTED_REPO) -> Result:
+    """리뷰어 1회 호출 → 결과 검사 → 리뷰 후 재조회(TOCTOU) → 게시 예정 코멘트."""
+    data = prepared.data
+    number, sha, run_id, round_no, limit = data.pr_number, data.head_sha, prepared.run_id, prepared.round_no, prepared.limit
 
     def failed(reason: str) -> Result:
-        body = render_comment(repo, number, ev.head_sha, ev.run_id, round_no, limit, "failed", None, reason)
-        return Result("failed", reason, "failed", number, ev.head_sha, body)
+        body = render_comment(repo, number, sha, run_id, round_no, limit, "failed", None, reason)
+        return Result("failed", reason, "failed", number, sha, body)
 
     try:
         raw = reviewer.review(data)
@@ -628,14 +700,42 @@ def run_review(
 
     # 리뷰하는 동안 새 커밋 push·close 가 있었을 수 있다 (TOCTOU). 오래된 SHA 의 결과는 버린다
     try:
-        again = verify_pull(gh, number, ev.head_sha, repo)
+        again = verify_pull(gh, number, sha, repo)
     except GitHubError:
-        return Result("failed", "github-api-error", pr_number=number, head_sha=ev.head_sha)
+        return Result("failed", "github-api-error", pr_number=number, head_sha=sha)
     if isinstance(again, Result):
-        return Result(again.status, f"{again.reason}-after-review", pr_number=number, head_sha=ev.head_sha)
+        return Result(again.status, f"{again.reason}-after-review", pr_number=number, head_sha=sha)
 
-    body = render_comment(repo, number, ev.head_sha, ev.run_id, round_no, limit, outcome.result, outcome)
-    return Result("reviewed", "planned-not-posted", outcome.result, number, ev.head_sha, body)
+    body = render_comment(repo, number, sha, run_id, round_no, limit, outcome.result, outcome)
+    return Result("reviewed", "planned-not-posted", outcome.result, number, sha, body)
+
+
+def run_review(
+    config: Config,
+    event_loader: Callable[[], object],
+    gh_factory: Callable[[], GitHub],
+    reviewer: Reviewer | None,
+    repo: str = TRUSTED_REPO,
+    policy_loader: PolicyLoader = load_trusted_policy,
+    extra_checks: tuple[ExtraCheck, ...] = (),
+) -> Result:
+    """prepare_review + finish_review 를 한 번에. 키·리뷰어가 없으면 아무것도 조회하지 않는다."""
+    off = check_config(config, reviewer)
+    if off:
+        return off  # 이벤트 파일도 읽지 않고, GitHub 클라이언트도 만들지 않는다
+    if reviewer is None:  # check_config 가 이미 막지만, 최적화 실행(-O)에서도 확실히 닫는다
+        return Result("disabled", "reviewer-not-implemented")
+    clients: list[GitHub] = []
+
+    def factory() -> GitHub:  # 필요해질 때 한 번만 만든다 (이벤트 단계에서 멈추면 만들지 않음)
+        if not clients:
+            clients.append(gh_factory())
+        return clients[0]
+
+    prepared = prepare_review(config, event_loader, factory, repo, policy_loader, extra_checks)
+    if isinstance(prepared, Result):
+        return prepared
+    return finish_review(prepared, reviewer, factory(), repo)
 
 
 # --- 실제 GitHub 조회 (켜져 있고 리뷰어가 있을 때만 생성. 지금 main() 에서는 도달하지 않음) ---

@@ -9,7 +9,8 @@ Issue #5의 자동화 구성 기록. 이 문서는 **실제로 저장소에 있�
 | Phase 1-A | 비밀 없는 정적 검사 CI (`.github/workflows/ci.yml`) | **실제 GitHub CI 통과·실패·복구 검증 완료** (PR #7, 아래 증적) |
 | Phase 1-B | 봇 코멘트 전달 테스트 (`.github/workflows/bot-event-test.yml`) | **실제 Actions 봇 코멘트 게시 및 일치하는 Claude Code ACK 확인**. 사용자 개입 없는 이벤트 수신 자체는 GitHub만으로 독립 확인 불가 |
 | Phase 2 | AI PR 리뷰어 (`ai-review.yml`, `scripts/automation/ai_review.py`) | **기본 OFF 골격과 오프라인 모의 테스트** ([Issue #9](https://github.com/MinYongUm/my-netops-platform/issues/9)). 아래 "ai-review" |
-| Phase 2-B | OpenAI 리뷰어·PR 코멘트 게시 어댑터 (`openai_reviewer.py`, `github_publisher.py`) | **코드와 오프라인 HTTP stub 테스트만**. 진입점·워크플로에 **연결하지 않음**. 실제 API 호출·코멘트 게시는 0회이고 **미검증** ([Issue #5](https://github.com/MinYongUm/my-netops-platform/issues/5)). 아래 "Phase 2-B" |
+| Phase 2-B | OpenAI 리뷰어·PR 코멘트 게시 어댑터 (`openai_reviewer.py`, `github_publisher.py`) | 코드와 오프라인 HTTP stub 테스트. 실제 API 호출·코멘트 게시는 0회이고 **미검증** ([Issue #5](https://github.com/MinYongUm/my-netops-platform/issues/5)). 아래 "Phase 2-B" |
+| Phase 2-C | 실행 파이프라인 (`review_pipeline.py`, `ai-review.yml` 2단계) | **코드 경로 연결과 오프라인 통합 테스트**. 워크플로는 여전히 기본 OFF·읽기 전용·**`OPENAI_API_KEY` 미연결·게시 job 없음** → 모델 호출·코멘트 0회. 아래 "Phase 2-C" |
 | Phase 3 | PR → CI → AI 리뷰 → Claude Code 수정 → 재검토 E2E | 미구현 |
 
 Phase 2·3의 전체 범위는 Issue #5, Phase 2의 세부 실행 기준은 Issue #9에 있다. 여기에 복제하지 않는다.
@@ -48,7 +49,7 @@ PR opened / reopened / synchronize / ready_for_review, push main, 수동 실행
 | shell-syntax | 추적 중인 `*.sh`에 `bash -n` |
 | python-compile | 추적 중인 `*.py`에 `python3 -m py_compile`. 바이트코드는 임시 디렉터리(`PYTHONPYCACHEPREFIX`)에만 생기고 저장소에 남지 않음 |
 | scanner-tests | 민감정보 검사기 단위 테스트 (`scripts/ci/test_scan_sensitive.py`) |
-| automation-tests | `scripts/automation/test_*.py` 전체: Routine 전달 브리지(`test_routine_bridge.py`), AI 리뷰어 게이트(`test_ai_review.py`), OpenAI 리뷰어 어댑터(`test_openai_reviewer.py`), 코멘트 게시 어댑터(`test_github_publisher.py`). 네트워크 연결을 막고 HTTP는 가짜 객체로 실행 |
+| automation-tests | `scripts/automation/test_*.py` 전체: Routine 전달 브리지(`test_routine_bridge.py`), AI 리뷰어 게이트(`test_ai_review.py`), OpenAI 리뷰어 어댑터(`test_openai_reviewer.py`), 코멘트 게시 어댑터(`test_github_publisher.py`), 실행 파이프라인 통합(`test_review_pipeline.py`). 네트워크 연결을 막고 HTTP는 가짜 객체로 실행 |
 | compose-config | `.env.example`의 `change_me`를 가짜 값으로 바꾼 임시 파일로 `docker compose config --quiet`. 컨테이너를 띄우지 않고, 실제 `.env`를 읽지 않음 |
 | whitespace | `git diff --check`. PR은 base 커밋 대비, push는 이전 커밋 대비, 수동 실행은 전체 트리 |
 | forbidden-files | 추적 중인 `.env*`(`.env.example` 제외), `sites/` 아래 `SITE-EXAMPLE.yaml` 외 파일 |
@@ -87,7 +88,7 @@ CI가 성공한 PR을 AI로 리뷰하기 위한 워크플로(`.github/workflows/
 |---|---|---|
 | 저장소 변수 `AI_REVIEW_ENABLED`가 정확히 `true`가 아님 (기본) | job **skipped**. 리뷰 성공 아님 | 0 |
 | CI가 `pull_request`가 아님, CI 실패·미완료, fork PR | job **skipped** | 0 |
-| 변수를 켬 (현재 `OPENAI_API_KEY` 미연결·리뷰어 없음) | 스크립트 `disabled` (exit 3, **빨간색**). 이벤트·GitHub API 조회 없음 | 0 |
+| 변수를 켬 (현재 `OPENAI_API_KEY` 미연결) | `Prepare` step이 GitHub를 **읽기 전용**으로 검증한 뒤, `Model review` step이 `disabled`(no-api-key, exit 3, **빨간색**) | 모델 0, 코멘트 0 (GitHub 읽기만) |
 | (테스트에서만) 켜짐 + 키 + 모의 리뷰어 | `reviewed` / `failed` / `blocked`. 코멘트는 게시하지 않음 | 가짜 객체만 |
 
 - 트리거: `workflow_run` (`workflows: [CI]`, `types: [completed]`). `workflow_run`은 **기본 브랜치의 워크플로 파일로만** 실행되므로, 이 PR이 병합되기 전에는 동작하지 않고 PR이 이 파일을 바꿔도 그 PR의 리뷰 동작은 바뀌지 않는다.
@@ -100,8 +101,9 @@ CI가 성공한 PR을 AI로 리뷰하기 위한 워크플로(`.github/workflows/
 1. 이벤트: 이 저장소의 `.github/workflows/ci.yml`, `pull_request`, completed·success, 40자리 head SHA, head 저장소가 이 저장소
 2. 대상 PR 확정: head SHA에 연결된 PR 중 open·base `main`·같은 저장소·같은 SHA인 것이 **정확히 1개** (이벤트에 PR 목록이 있으면 그 안에서만). 0개·여러 개면 중단, 추정하지 않음
 3. PR 재조회: open, base `main`, fork 아님, 작성자 = 저장소 소유자, head SHA 일치
-4. CI run 재조회: 같은 run이 여전히 success이고 같은 SHA·워크플로·이벤트인지
-5. 리뷰 기록: `github-actions[bot]` 코멘트의 마커만 센다 (사람·다른 봇·PR 본문의 마커는 무시). 같은 SHA는 결과와 관계없이 다시 리뷰하지 않음. PR당 상한 기본 2회, `AI_REVIEW_MAX_ROUNDS`로 최대 3회. `failed`도 1회로 센다
+4. CI run 재조회: 같은 run이 여전히 success이고 같은 SHA·경로·이벤트인지, **기본 브랜치에 등록된 `ci.yml`과 같은 workflow id**인지, **대상 PR에 연결된 run**인지 (Phase 2-C)
+4-1. 보호 경로: PR이 `.github/`·`scripts/ci/`·`scripts/automation/`(이름 변경 전 경로 포함)를 바꾸면 자동 리뷰하지 않고 `blocked`(`manual-review-required:protected-path`). 파일이 1000개를 넘어 다 확인할 수 없으면 `files-unverifiable` (Phase 2-C)
+5. 리뷰 기록: `github-actions[bot]` 코멘트의 마커만 센다 (사람·다른 봇·PR 본문의 마커는 무시). 같은 SHA는 결과와 관계없이 다시 리뷰하지 않음. PR당 상한 기본 2회, `AI_REVIEW_MAX_ROUNDS`로 최대 3회. `failed`도 1회로 센다. 파이프라인은 여기에 **Actions 실행 기록** 상한을 더한다 (아래 Phase 2-C)
 6. 리뷰 입력: PR 제목·본문·변경 파일은 `untrusted_*` 필드에 **데이터로만** 담고 크기를 자른다 (본문 2만 자, 파일당 2만 자, 전체 10만 자, 파일 100개)
 7. 리뷰어 1회 호출. 시간 초과·오류·형식 위반(`needs_changes`인데 지적 없음, `no_changes`인데 Blocker·Important 있음 등)은 `failed`. 입력이 불완전하면(파일 목록 상한, patch 잘림·생략, 제목·본문 잘림) `no_changes`를 허용하지 않고 `failed`(`review-input-incomplete`)
 8. 리뷰 후 PR 재조회 (TOCTOU): head가 바뀌었거나 닫혔으면 결과를 버린다
@@ -127,16 +129,16 @@ CI가 성공한 PR을 AI로 리뷰하기 위한 워크플로(`.github/workflows/
 
 ### 실제 활성화 전에 필요한 것 (모두 사용자 승인, 각각 별도 PR)
 
-1. 모델 API(OpenAI 등) 사용·과금·모델 선택과 계정 예산 한도. **Responses API 요청·응답 형식과 Structured Outputs 지원 모델을 공식 문서로 재확인** (Phase 2-B 작성 세션에서는 `developers.openai.com` 접근이 막혀 확인하지 못함)
-2. `OPENAI_API_KEY` Secret 등록과 워크플로 연결, `AI_REVIEW_MODEL` 등 설정 변수
-3. `ai_review.main()`에 `OpenAIReviewer` 연결 (Phase 2-B 코드는 있으나 연결 안 됨)
-4. 코멘트 게시: `pull-requests: write`를 **리뷰 job과 분리된 job**에서만, `github_publisher.publish_review(publish=True)` 연결
-5. `AI_REVIEW_ENABLED` 변수 켜기
-6. Phase 3: 리뷰 → Claude 수정 → 재검토 E2E 실험
+1. 모델 API(OpenAI 등) 사용·과금·모델 선택과 계정 예산 한도. Structured Outputs 지원 모델과 모델별 한도를 최신 공식 문서로 확인
+2. `OPENAI_API_KEY` Secret 등록(사용자가 GitHub 보안 설정에서 직접)과 `Model review` step에 연결, `AI_REVIEW_MODEL` 등 변수
+3. 게시 job 추가: `pull-requests: write`만, 모델 키 없음, `review_pipeline.py publish` + `AI_REVIEW_PUBLISH=true`. 결과 파일은 review job의 artifact로 전달
+4. `AI_REVIEW_ENABLED` 변수 켜기
+5. 단일 시범: 승인된 테스트 PR 1건, 모델 호출 최대 1회(`AI_REVIEW_MAX_ROUNDS=1`), 코멘트 최대 1개
+6. Phase 3: 리뷰 → Claude 수정 → 재검토 E2E 실험 (1차 리뷰·코멘트 성공 후 별도 승인)
 
 ### Phase 2-B: OpenAI 리뷰어·코멘트 게시 어댑터 (Issue #5) — 연결 안 됨
 
-**코드와 오프라인 테스트만 있다.** `ai_review.main()`은 여전히 `reviewer=None`이고 게시 모듈을 부르지 않는다. 워크플로(`ai-review.yml`)는 바뀌지 않았다: 기본 OFF, 읽기 전용, Secret 미연결. 따라서 현재 비용·외부 호출·코멘트는 0이다. **"비용 0"은 이 OFF 상태에서만 맞는 말이다.**
+어댑터 코드와 오프라인 테스트다. Phase 2-C에서 `review_pipeline.py`가 이 어댑터들을 실행 경로로 연결했다 (워크플로는 여전히 키·게시 미연결). `ai_review.main()`은 하위 호환용으로 남아 있고 `reviewer=None`이다. **"비용 0"은 현재 OFF 상태에서만 맞는 말이다.**
 
 #### 리뷰 입력 (`ai_review.py`)
 
@@ -180,10 +182,55 @@ CI(pull_request) 성공 → workflow_run (main의 ai-review.yml)
 
 #### 남은 한계와 다음 게이트에서 보완할 것
 
-- **봇 코멘트 삭제로 상한 초기화:** 지금 기록은 PR 코멘트 마커다. 다음 라이브 게이트에서 Actions 실행 기록(예: `run-name`에 PR·SHA를 넣고 성공한 review job 수를 세는 방식, `routine-bridge`와 같은 방식)을 함께 기록으로 쓰는 안을 제안한다. 실행 기록은 PR 코멘트 작성자가 지울 수 없다
+- **봇 코멘트 삭제로 상한 초기화:** Phase 2-C에서 Actions 실행 기록 상한을 추가해 보완했다 (아래)
 - 동시 실행 경합: 같은 PR 브랜치는 `concurrency`로 하나만 돌고, 게시 직전 중복 검사를 한다. 서로 다른 브랜치 이름으로 같은 SHA를 동시에 올리는 경우까지 완전히 막지는 못한다
 - 비용: PR당 회차 상한(기본 2, 최대 3) × 리뷰 1회당 HTTP 1회. 토큰 비용은 입력 크기에 비례한다. **계정·프로젝트 예산 한도는 OpenAI 쪽에서 사용자가 설정해야 한다**
 - Responses API 형식·지원 모델은 작성 시점 기준이며 실제 API로 검증하지 않았다
+
+### Phase 2-C: 실행 파이프라인 (Issue #5) — 연결됨, 기본 OFF
+
+`scripts/automation/review_pipeline.py`가 기존 모듈을 3단계로 연결한다. 기존 어댑터를 다시 구현하지 않았다.
+
+| 단계 | 하는 일 | 필요한 것 | 현재 워크플로 |
+|---|---|---|---|
+| `prepare` | `ai_review.prepare_review` (이벤트·PR·CI 출처·보호 경로·코멘트 기록·**실행 기록**·Issue·정책) → 전달 파일 | GitHub 읽기 | `Prepare (gates, no model key)` step |
+| `review` | 전달 파일 → `OpenAIReviewer` 1회 → `ai_review.finish_review`(결과 검사·리뷰 후 재조회) → 결과 파일 | GitHub 읽기 + 모델 키 | `Model review` step. **키 미연결 → disabled** |
+| `publish` | 결과 파일 → CI 출처·보호 경로 재검사 → `github_publisher.publish_review` | GitHub 쓰기 (모델 키 없음) | **없음.** 실행해도 `AI_REVIEW_PUBLISH=true`가 아니면 조회·쓰기 0회 (`dry_run`) |
+
+종료 코드: 0 진행(`ready`·`reviewed`·`posted`·`dry_run`), 1 `failed`, 2 `blocked`·`skipped`, 3 `disabled`. 워크플로는 `python3 -I`(격리 모드)로 실행하므로, 스크립트는 자기 디렉터리만 import 경로에 넣는다.
+
+**로컬 단독 실행 (모두 외부 호출 0회):**
+
+```bash
+python3 -I -B scripts/automation/review_pipeline.py prepare    # 변수 없음 → result=disabled reason=flag-off, exit 3
+AI_REVIEW_ENABLED=true python3 -I -B scripts/automation/review_pipeline.py review    # 키 없음 → reason=no-api-key, exit 3
+```
+
+#### 신뢰된 CI 출처 (PR #15 리뷰 게이트 1)
+
+- 확인 항목
+  - CI run이 **기본 브랜치에 등록된 `ci.yml`의 workflow id**를 가져야 한다
+  - 경로·이벤트·head SHA·저장소가 맞아야 한다
+  - run이 **대상 PR에 연결**돼 있어야 한다
+- workflow id가 같아도 PR이 `ci.yml` 내용을 바꿨다면 "CI 성공"은 신뢰된 검사를 실행한 결과가 아니다. 그래서 PR이 `.github/`·`scripts/ci/`·`scripts/automation/`을 바꾸면 **자동 리뷰하지 않고 수동 검토**로 돌린다. 이 규칙에 따라 리뷰 파이프라인 자체를 바꾸는 PR(이 PR 포함)은 AI 리뷰 대상이 아니다
+- publish 단계도 게시 직전에 같은 출처·보호 경로 검사를 다시 한다. 결과 파일의 내용은 믿지 않는다
+
+#### 호출 상한 — 삭제할 수 없는 기록 (PR #15 리뷰 게이트 2)
+
+- `ai-review` run 이름: `ai-review pr=PR번호 head=SHA`
+- 이 워크플로의 과거 실행 중 `review` job의 **`Model review` step이 시작된 실행**을 1회로 센다. 셈에 넣는 경우:
+  - `in_progress`, 또는 completed이면서 conclusion이 `skipped`가 아닌 것
+  - 따라서 성공·실패·시간 초과·취소 모두 포함
+- 같은 SHA가 있으면 `duplicate-sha-run`, PR당 횟수가 상한(기본 2, 최대 3)에 닿으면 `round-limit-run`이다. 지금 실행 중인 자신은 제외한다
+- 기록을 끝까지 읽지 못하면 `run-ledger-incomplete`로 실패한다: 1000건 초과이거나, 이 PR 후보가 30건을 넘는 경우
+- PR 코멘트를 지워도 실행 기록은 남는다. 저장소 관리자가 실행 기록 자체를 지우는 경우는 막지 못한다
+- 재시도 0: 모델 HTTP는 리뷰 1회당 1번이다. 키 없이 변수만 켠 상태에서 `Model review` step이 돌아도 1회로 센다(보수적)
+- 동시 실행: 같은 PR 브랜치는 `concurrency`로 하나만 실행한다. 새 push가 진행 중 실행을 취소하는데, 이미 시작된 `Model review`는 그래도 1회로 남는다
+
+#### Claude 연결
+
+- 게시 마커는 그대로 `<!-- ai-review:v1 head=SHA result=... -->`이고, **`needs_changes`만** 수정 전달 대상이다(`routine_bridge`가 판정)
+- 네이티브 Routine 구독 세션이 `github-actions[bot]` 리뷰 코멘트를 무인으로 받는지는 **아직 미검증**이다. 받지 못하면 기존 OFF 브리지(`routine-bridge.yml`)가 대안이다. 새 브리지는 만들지 않았고, `/fire` 활성화·토큰·Claude push는 승인 전 실행하지 않는다
 
 ## routine-bridge (Phase 1-C, Issue #11)
 
