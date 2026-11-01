@@ -59,6 +59,11 @@ scanner_tests() {
     python3 -B -m unittest discover -s scripts/ci -p 'test_*.py'
 }
 
+# --- 3-2. 자동화 브리지 모의 테스트 (네트워크 없음, Issue #11) ---
+automation_tests() {
+    python3 -B -m unittest discover -s scripts/automation -p 'test_*.py'
+}
+
 # --- 4. Compose 구성 (가짜 값만, 출력 없이 검증) ---
 compose_config() {
     if ! docker compose version >/dev/null 2>&1; then
@@ -106,6 +111,7 @@ sensitive() {
 check "shell-syntax" shell_syntax
 check "python-compile" python_compile
 check "scanner-tests" scanner_tests
+check "automation-tests" automation_tests
 check "compose-config" compose_config
 check "whitespace" whitespace
 check "forbidden-files" forbidden_files
