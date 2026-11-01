@@ -31,6 +31,7 @@ OTHER_SHA = "d" * 40
 PR = 21
 ISSUE = 9
 RUN_ID = 41260032790
+CI_WORKFLOW_ID = 402802049
 POLICY = (("docs/ARCHITECTURE.md", "trusted architecture policy"), ("CLAUDE.md", "trusted claude rules"))
 FAKE_KEY = "fake-openai-key-for-tests-only"
 FAKE_GH_TOKEN = "fake-github-token-for-tests-only"
@@ -63,6 +64,7 @@ def event(**over) -> dict:
         "head_branch": "claude/some-change",
         "head_repository": {"full_name": REPO},
         "pull_requests": [{"number": PR}],
+        "workflow_id": CI_WORKFLOW_ID,
         "display_title": INJECTION,  # 비신뢰 문자열. 쓰지 않아야 한다
     }
     run.update(over)
@@ -102,6 +104,7 @@ class FakeGitHub:
         self.run = copy.deepcopy(event()["workflow_run"])
         self.comments: list[dict] = []
         self.files = [{"filename": "scripts/x.py", "status": "modified", "patch": "@@ -1 +1 @@\n-a\n+b # " + INJECTION}]
+        self.workflow = {"id": CI_WORKFLOW_ID, "path": ".github/workflows/ci.yml", "state": "active"}
         self.issues = {ISSUE: {"number": ISSUE, "user": {"login": OWNER}, "title": "Issue title " + INJECTION,
                                "body": "## DoD\n- [ ] do the thing\n" + INJECTION}}
         self.fail_on: str | None = None
@@ -127,7 +130,11 @@ class FakeGitHub:
             start = (page - 1) * ar.COMMENT_PER_PAGE
             return self.comments[start:start + ar.COMMENT_PER_PAGE]
         if path.startswith(f"/repos/{REPO}/pulls/{PR}/files?"):
-            return self.files
+            page = int(path.rsplit("page=", 1)[1])
+            start = (page - 1) * ar.FILES_PER_PAGE
+            return self.files[start:start + ar.FILES_PER_PAGE] if isinstance(self.files, list) else self.files
+        if path == f"/repos/{REPO}/actions/workflows/ci.yml":
+            return self.workflow
         if path.startswith(f"/repos/{REPO}/issues/") and path.rsplit("/", 1)[1].isdigit():
             number = int(path.rsplit("/", 1)[1])
             if number in self.issues:
@@ -836,8 +843,10 @@ class WorkflowGuardTest(unittest.TestCase):
 
     def test_no_pr_head_checkout(self) -> None:
         self.assertNotIn("ref:", self.code)
-        self.assertNotIn("head_sha", self.code)
-        self.assertNotIn("head_branch", self.code.split("steps:", 1)[1])  # head 브랜치를 step 에서 쓰지 않음
+        steps = self.code.split("steps:", 1)[1]
+        # head SHA·브랜치는 run-name(기록용 라벨)·concurrency 에만 쓰고, checkout·step 에서는 쓰지 않는다
+        self.assertNotIn("head_sha", steps)
+        self.assertNotIn("head_branch", steps)
         self.assertIn("persist-credentials: false", self.code)
 
     def test_only_pinned_checkout_action(self) -> None:
@@ -850,7 +859,16 @@ class WorkflowGuardTest(unittest.TestCase):
 
     def test_values_passed_via_env_only(self) -> None:
         run_lines = [line for line in self.code.splitlines() if line.strip().startswith("run:")]
-        self.assertEqual(run_lines, ["        run: python3 -I -B scripts/automation/ai_review.py"])
+        self.assertEqual(run_lines, [
+            "        run: python3 -I -B scripts/automation/review_pipeline.py prepare",
+            "        run: python3 -I -B scripts/automation/review_pipeline.py review",
+        ])
+
+    def test_no_publish_stage_or_model_key(self) -> None:
+        self.assertNotIn("review_pipeline.py publish", self.code)
+        self.assertNotIn("AI_REVIEW_PUBLISH", self.code)
+        self.assertNotIn("OPENAI_API_KEY:", self.code)
+        self.assertEqual(self.code.count("uses:"), 1)
 
 
 if __name__ == "__main__":
