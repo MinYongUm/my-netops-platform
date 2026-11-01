@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """inventory.py — 사이트 프로필(sites/<회사>.yaml)을 Zabbix 호스트로 맞춘다 (Lesson 1-1).
 
-지금은 1단계: 프로필 읽기와 검사만 한다. Zabbix 에는 접속하지 않는다.
+1단계: 프로필 읽기와 검사. 2단계: Zabbix 조회와 --dry-run.
+쓰기 API(create, update, massadd)는 아직 쓰지 않는다.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ from typing import Any
 
 import yaml
 
+from zabbix_api import ADMIN_USER, ApiError, ZabbixClient, read_env
+
 TOP_KEYS = ("company", "sites")
 SITE_KEYS = ("code", "devices")
 DEVICE_KEYS = ("name", "ip")
@@ -26,6 +29,10 @@ NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
 MERGE_TAG = "tag:yaml.org,2002:merge"
 # "이 네트워크" 대역. is_unspecified 는 0.0.0.0 하나만 보므로 대역 전체를 따로 막는다
 THIS_NETWORK = ipaddress.IPv4Network("0.0.0.0/8")
+
+SITES_PREFIX = "Sites/"  # 관리 범위. 상위 그룹 Sites 자체는 제외
+ICMP_TEMPLATE = "ICMP Ping"  # 템플릿 기술 이름(host)
+EXIT_NOT_YET = 2  # --dry-run 없이 실행했을 때
 
 log = logging.getLogger("inventory")
 
@@ -53,6 +60,17 @@ class ProfileError(Exception):
     def __init__(self, errors: list[str]) -> None:
         super().__init__(f"프로필 오류 {len(errors)}건")
         self.errors = errors
+
+
+@dataclass
+class ZabbixState:
+    """조회 결과. 비교(plan)는 이 값만 보고 API 를 부르지 않는다."""
+
+    template_id: str
+    groups: dict[str, str]  # Sites/* 그룹 이름 → groupid
+    hosts: list[dict[str, Any]]  # Sites/* 그룹에 속한 호스트 (host.get)
+    # Sites/* 밖에서 프로필 이름과 대소문자 무시로 같은 호스트
+    others: list[dict[str, Any]]
 
 
 def find_anchors(text: str, errors: list[str]) -> None:
@@ -312,13 +330,113 @@ def load_profile(path: Path) -> Profile:
     return profile
 
 
+def fetch_state(zbx: ZabbixClient, profile: Profile) -> ZabbixState:
+    """비교에 필요한 것을 읽기 API 로만 조회한다."""
+    found = zbx.call(
+        "template.get",
+        {"output": ["templateid"], "filter": {"host": [ICMP_TEMPLATE]}},
+    )
+    if not found:
+        raise ApiError(f"템플릿 '{ICMP_TEMPLATE}' 을(를) 찾을 수 없습니다")
+    template_id = found[0]["templateid"]
+
+    # search 는 대소문자를 무시하고 부분 일치이므로 이름으로 한 번 더 거른다
+    groups = {
+        g["name"]: g["groupid"]
+        for g in zbx.call(
+            "hostgroup.get",
+            {
+                "output": ["groupid", "name"],
+                "search": {"name": SITES_PREFIX},
+                "startSearch": True,
+            },
+        )
+        if g["name"].startswith(SITES_PREFIX)
+    }
+
+    hosts: list[dict[str, Any]] = []
+    # groupids 가 빠지면 전체 호스트가 오므로 그룹이 없으면 부르지 않는다
+    if groups:
+        hosts = zbx.call(
+            "host.get",
+            {
+                "groupids": list(groups.values()),
+                "output": ["hostid", "host", "status"],
+                "selectInterfaces": [
+                    "interfaceid", "type", "main", "useip", "ip", "port",
+                ],
+                "selectHostGroups": ["groupid", "name"],
+                "selectParentTemplates": ["templateid", "host"],
+            },
+        )
+
+    # Sites/* 에서 찾지 못한 프로필 이름만 밖에 있는지 확인한다 (결정 1)
+    inside = {h["host"] for h in hosts}
+    missing = [d.name for d in profile.devices if d.name not in inside]
+    others: list[dict[str, Any]] = []
+    if missing:
+        inside_ids = {h["hostid"] for h in hosts}
+        wanted = {name.casefold() for name in missing}
+        candidates = zbx.call(
+            "host.get",
+            {
+                "output": ["hostid", "host"],
+                "search": {"host": missing},
+                "searchByAny": True,
+                "selectHostGroups": ["name"],
+            },
+        )
+        others = [
+            h
+            for h in candidates
+            if h["hostid"] not in inside_ids
+            and h["host"].casefold() in wanted
+        ]
+
+    return ZabbixState(
+        template_id=template_id, groups=groups, hosts=hosts, others=others
+    )
+
+
+def connect(env_file: Path) -> ZabbixClient:
+    """.env 의 Admin 비밀번호로만 로그인한다.
+
+    bootstrap 의 login_admin 은 비밀번호를 바꾸는 쓰기(user.update)가 있어 쓰지 않는다.
+    """
+    env = read_env(env_file)
+    for key in ("ZBX_WEB_PORT", "ZBX_ADMIN_PASSWORD"):
+        if not env.get(key):
+            raise ApiError(f"{env_file} 에 {key} 가 없습니다")
+    zbx = ZabbixClient(
+        f"http://localhost:{env['ZBX_WEB_PORT']}/api_jsonrpc.php"
+    )
+    version = zbx.call("apiinfo.version", {})
+    log.info("Zabbix API 응답: %s", version)
+    try:
+        zbx.login(ADMIN_USER, env["ZBX_ADMIN_PASSWORD"])
+    except ApiError as e:
+        raise ApiError(
+            f".env 비밀번호로 Admin 로그인 실패 ({e}). ./install.sh 를 먼저 실행하세요"
+        ) from e
+    return zbx
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="사이트 프로필을 Zabbix 호스트로 맞춘다. 지금은 프로필 검사만 한다"
+        description="사이트 프로필을 Zabbix 호스트로 맞춘다. "
+        "지금은 --dry-run(변경 목록 출력)만 된다"
     )
     parser.add_argument(
-        "profile", type=Path, help="사이트 프로필 YAML (예: sites/SITE-EXAMPLE.yaml)"
+        "profile",
+        type=Path,
+        help="사이트 프로필 YAML (예: sites/SITE-EXAMPLE.yaml)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Zabbix 를 바꾸지 않고 바뀔 내용만 출력한다",
+    )
+    parser.add_argument("--env-file", type=Path, default=Path(".env"))
     args = parser.parse_args()
 
     # install.sh, bootstrap.py 와 같은 [INFO] / [ERROR] 형식
@@ -331,7 +449,10 @@ def main() -> int:
     except ProfileError as e:
         for message in e.errors:
             log.error("%s", message)
-        log.error("프로필 검사 실패 (%d건). 아무것도 바꾸지 않았습니다.", len(e.errors))
+        log.error(
+            "프로필 검사 실패 (%d건). 아무것도 바꾸지 않았습니다.",
+            len(e.errors),
+        )
         return 1
 
     log.info(
@@ -339,6 +460,37 @@ def main() -> int:
         profile.company,
         len(profile.sites),
         len(profile.devices),
+    )
+
+    if not args.dry_run:
+        log.error(
+            "실행 모드는 다음 단계에서 추가됩니다. --dry-run 으로 실행하세요"
+        )
+        return EXIT_NOT_YET
+
+    try:
+        zbx = connect(args.env_file)
+        try:
+            state = fetch_state(zbx, profile)
+        finally:
+            # logout 실패가 조회 중 난 원래 오류를 덮지 않게 경고만 남긴다
+            try:
+                zbx.logout()
+            except (ApiError, OSError) as e:
+                log.warning("로그아웃 실패: %s", e)
+    except ApiError as e:
+        log.error("API 오류: %s", e)
+        return 1
+    except OSError as e:
+        # .env 읽기 실패, 연결 거부·타임아웃은 모두 OSError
+        log.error("연결할 수 없습니다: %s", e)
+        return 1
+
+    log.info(
+        "[dry-run] 조회: Sites/* 그룹 %d, 호스트 %d, Sites/* 밖 같은 이름 %d",
+        len(state.groups),
+        len(state.hosts),
+        len(state.others),
     )
     return 0
 
