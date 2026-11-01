@@ -203,7 +203,8 @@ CI(pull_request) 성공 → workflow_run (main의 ai-review.yml)
 
 ```bash
 python3 -I -B scripts/automation/review_pipeline.py prepare    # 변수 없음 → result=disabled reason=flag-off, exit 3
-AI_REVIEW_ENABLED=true python3 -I -B scripts/automation/review_pipeline.py review    # 키 없음 → reason=no-api-key, exit 3
+AI_REVIEW_ENABLED=true GITHUB_RUN_ATTEMPT=1 python3 -I -B scripts/automation/review_pipeline.py review    # 키 없음 → reason=no-api-key, exit 3
+AI_REVIEW_ENABLED=true GITHUB_RUN_ATTEMPT=2 python3 -I -B scripts/automation/review_pipeline.py review    # 재실행 → reason=rerun-not-allowed, exit 2
 ```
 
 #### 신뢰된 CI 출처 (PR #15 리뷰 게이트 1)
@@ -226,6 +227,13 @@ AI_REVIEW_ENABLED=true python3 -I -B scripts/automation/review_pipeline.py revie
 - PR 코멘트를 지워도 실행 기록은 남는다. 저장소 관리자가 실행 기록 자체를 지우는 경우는 막지 못한다
 - 재시도 0: 모델 HTTP는 리뷰 1회당 1번이다. 키 없이 변수만 켠 상태에서 `Model review` step이 돌아도 1회로 센다(보수적)
 - 동시 실행: 같은 PR 브랜치는 `concurrency`로 하나만 실행한다. 새 push가 진행 중 실행을 취소하는데, 이미 시작된 `Model review`는 그래도 1회로 남는다
+
+**실행 기록이 빠지는 경로는 모델 호출 전에 막는다 (PR #16 리뷰):**
+
+| 경로 | 왜 기록이 빠지나 | 막는 방법 |
+|---|---|---|
+| 재실행 (Re-run) | 같은 run ID에서 `run_attempt`만 늘어난다. 실행 기록은 현재 run ID를 제외하므로 첫 시도의 호출이 안 보인다 | `GITHUB_RUN_ATTEMPT`가 정확히 `1`이 아니면 prepare·review 모두 이벤트·GitHub·모델 전에 차단(`rerun-not-allowed`, 값이 없거나 이상하면 `run-attempt-invalid`). 현재 run의 API `run_attempt`도 1이어야 함. **재실행으로는 자동 리뷰를 다시 하지 않는다** (새 커밋 push로만) |
+| PR 식별자 누락 | `run-name`은 이벤트의 `pull_requests[0].number`로 만든다. 목록이 비면 `pr=`가 되어 기록 정규식에 안 맞는다 | 이벤트 PR 목록이 정확히 [확정된 PR]이고, **현재 run의 실제 이름이 `ai-review pr=N head=SHA`**일 때만 진행(`run-name-pr-untracked`). PR을 추측하지 않는다 |
 
 #### Claude 연결
 

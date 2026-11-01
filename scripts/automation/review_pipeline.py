@@ -15,6 +15,11 @@
   1. PR 코멘트의 ai-review 마커 (ai_review.check_ledger)
   2. Actions 실행 기록 (이 파일의 run_ledger): ai-review 워크플로에서 "Model review" step 이 시작된 실행.
      PR 코멘트를 지워도 남고, 시간 초과·실패·진행 중인 실행도 1회로 센다 (재시도 0)
+이 기록이 빠지는 경로는 모델 호출 전에 막는다 (PR #16 리뷰):
+  - 재실행: Re-run 은 같은 run ID 의 run_attempt 만 늘린다. 실행 기록은 현재 run ID 를 제외하므로
+    재실행이면 첫 시도의 호출을 못 본다 → GITHUB_RUN_ATTEMPT 가 정확히 1 이 아니면 prepare·review 모두 차단
+  - PR 식별자: run-name 은 이벤트의 pull_requests[0].number 로 만든다. 이벤트 PR 이 정확히 1개가 아니거나,
+    현재 run 의 실제 이름이 "ai-review pr=N head=SHA" 가 아니면 기록이 안 남으므로 차단 (PR 을 추측하지 않음)
 
 종료 코드: 0 진행(ready/reviewed/posted/dry_run), 1 failed, 2 blocked/skipped, 3 disabled.
 키·토큰·응답 본문은 출력하지 않는다. 표준 라이브러리만 사용한다. 운영 문서: docs/AUTOMATION.md
@@ -218,18 +223,50 @@ def stage_prepare(env: Mapping[str, str], event_loader: Callable[[], object],
                   gh_factory: Callable[[], ar.GitHub], policy_loader: ar.PolicyLoader = ar.load_trusted_policy,
                   repo: str = ar.TRUSTED_REPO) -> tuple[ar.Result, str]:
     """(결과, handoff 문자열). 통과하면 결과 status=ready."""
+    if not ar.Config.from_env(env).enabled:
+        return ar.Result("disabled", "flag-off"), ""
+    stop = check_run_attempt(env)
+    if stop:
+        return stop, ""  # 이벤트·GitHub 조회 전에 멈춘다
     current = _current_run_id(env)
     if current is None:
-        config = ar.Config.from_env(env)
-        if not config.enabled:
-            return ar.Result("disabled", "flag-off"), ""
         return ar.Result("failed", "no-run-id"), ""
+    # 순서: 이 실행이 기록될 수 있는지(run-name) 먼저 확인한 뒤 실행 기록 상한을 본다
     prepared = ar.prepare_review(ar.Config.from_env(env), event_loader, gh_factory, repo, policy_loader,
-                                 (run_ledger_check(current, repo),))
+                                 (run_identity_check(current, repo), run_ledger_check(current, repo)))
     if isinstance(prepared, ar.Result):
         return prepared, ""
     data = prepared.data
     return ar.Result("ready", "prepared", pr_number=data.pr_number, head_sha=data.head_sha), dump_prepared(prepared)
+
+
+def check_run_attempt(env: Mapping[str, str]) -> ar.Result | None:
+    """재실행(run_attempt 2 이상)은 자동 리뷰하지 않는다. 값이 없거나 이상해도 막는다."""
+    raw = env.get("GITHUB_RUN_ATTEMPT", "")
+    if raw == "1":
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,5}", raw):
+        return ar.Result("blocked", "rerun-not-allowed")
+    return ar.Result("failed", "run-attempt-invalid")
+
+
+def run_identity_check(current_run_id: int, repo: str = ar.TRUSTED_REPO) -> ar.ExtraCheck:
+    """이 실행이 실행 기록에 올바른 PR·SHA 로 남는지 모델 호출 전에 확인한다."""
+
+    def check(gh: ar.GitHub, ev: ar.Event, pr: int, limit: int) -> ar.Result | None:
+        # run-name 은 pull_requests[0] 을 쓴다. 정확히 1개이고 확정된 PR 과 같아야 한다
+        if ev.payload_prs != (pr,):
+            return ar.Result("blocked", "run-name-pr-untracked")
+        run = gh.get(f"/repos/{repo}/actions/runs/{current_run_id}")
+        if not isinstance(run, dict):
+            return ar.Result("failed", "github-unexpected-response")
+        if run.get("display_title") != f"ai-review pr={pr} head={ev.head_sha}":
+            return ar.Result("blocked", "run-name-pr-untracked")
+        if run.get("run_attempt") != 1:
+            return ar.Result("blocked", "rerun-not-allowed")
+        return None
+
+    return check
 
 
 def _current_run_id(env: Mapping[str, str]) -> int | None:
@@ -242,6 +279,9 @@ def stage_review(env: Mapping[str, str], handoff: str, gh_factory: Callable[[], 
     """(결과, 결과 파일 문자열). 키가 없으면 disabled 이고 모델·GitHub 호출 0회."""
     if not ar.Config.from_env(env).enabled:
         return ar.Result("disabled", "flag-off"), ""
+    stop = check_run_attempt(env)
+    if stop:
+        return stop, ""  # 재실행이면 키·전달 파일을 보기 전에 멈춘다
     try:
         oconfig = orv.OpenAIConfig.from_env(env)
     except ar.ReviewerError as exc:

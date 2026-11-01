@@ -26,7 +26,8 @@ CURRENT_RUN = 9_000_000_001
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ai-review.yml"
 FAKE_KEY = "fake-openai-key-for-tests-only"
 
-GATE_ENV = {"AI_REVIEW_ENABLED": "true", "GITHUB_TOKEN": "fake-gh", "GITHUB_RUN_ID": str(CURRENT_RUN)}
+GATE_ENV = {"AI_REVIEW_ENABLED": "true", "GITHUB_TOKEN": "fake-gh", "GITHUB_RUN_ID": str(CURRENT_RUN),
+            "GITHUB_RUN_ATTEMPT": "1"}
 MODEL_ENV = {**GATE_ENV, "OPENAI_API_KEY": FAKE_KEY, "AI_REVIEW_MODEL": "gpt-4.1-mini"}
 
 
@@ -37,6 +38,8 @@ class PipelineGitHub(PublishGitHub):
         super().__init__()
         self.ai_runs: list[dict] = []
         self.ai_jobs: dict[int, list[dict]] = {}
+        # 지금 실행 중인 ai-review run (run-name 이 이 PR·SHA 로 기록되는지 확인용)
+        self.current_run = {"id": CURRENT_RUN, "display_title": f"ai-review pr={PR} head={SHA}", "run_attempt": 1}
 
     def add_attempt(self, run_id: int, sha: str, pr: int = PR, step_status: str = "completed",
                     conclusion: str | None = "success", title: str | None = None) -> None:
@@ -47,6 +50,11 @@ class PipelineGitHub(PublishGitHub):
         ]}]
 
     def get(self, path: str) -> object:
+        if path == f"/repos/{REPO}/actions/runs/{CURRENT_RUN}":
+            self.calls.append(path)
+            if self.fail_on and self.fail_on in path:
+                raise ar.GitHubError()
+            return self.current_run
         if path.startswith(f"/repos/{REPO}/actions/workflows/ai-review.yml/runs?"):
             self.calls.append(path)
             if self.fail_on and self.fail_on in path:
@@ -314,6 +322,87 @@ class RunLedgerTest(PipelineCase):
         self.assertEqual(len(self.transport.calls), 1)
 
 
+# --- 재실행·PR 식별자 (PR #16 리뷰) ---
+
+
+class RerunAndIdentityTest(PipelineCase):
+    """재실행·PR 식별자 누락으로 실행 기록이 빠지는 경로는 모델 호출 전에 막는다."""
+
+    def test_rerun_blocked_before_event_and_github(self) -> None:
+        for raw, status, reason in (("2", "blocked", "rerun-not-allowed"), ("17", "blocked", "rerun-not-allowed"),
+                                    ("", "failed", "run-attempt-invalid"), ("01", "failed", "run-attempt-invalid"),
+                                    ("abc", "failed", "run-attempt-invalid"), (" 1", "failed", "run-attempt-invalid")):
+            with self.subTest(attempt=raw):
+                loaded = []
+                env = {**GATE_ENV, "GITHUB_RUN_ATTEMPT": raw}
+                result, handoff = rp.stage_prepare(env, lambda: loaded.append(1) or event(), self.factory,
+                                                   lambda: (POLICY, ()))
+                self.assertEqual((result.status, result.reason, handoff), (status, reason, ""))
+                self.assertEqual((loaded, self.gh_created), ([], 0))
+        env = dict(GATE_ENV)
+        del env["GITHUB_RUN_ATTEMPT"]
+        self.assertEqual(self.prepare(env=env)[0].reason, "run-attempt-invalid")
+
+    def test_rerun_blocked_at_review_stage_before_model(self) -> None:
+        _, handoff = self.prepare()
+        created = self.gh_created
+        for raw, reason in (("2", "rerun-not-allowed"), ("", "run-attempt-invalid")):
+            with self.subTest(attempt=raw):
+                result, out = self.review(handoff, env={**MODEL_ENV, "GITHUB_RUN_ATTEMPT": raw})
+                self.assertEqual((result.reason, out), (reason, ""))
+                self.assertEqual(self.transport.calls, [])
+                self.assertEqual(self.gh_created, created)
+
+    def test_rerun_of_run_whose_first_attempt_called_model(self) -> None:
+        """리뷰 지적 시나리오: 첫 시도에서 모델이 호출된 같은 run 을 재실행 → 모델 호출 0회."""
+        self.gh.current_run["run_attempt"] = 2
+        self.gh.ai_jobs[CURRENT_RUN] = [{"name": "review", "steps": [
+            {"name": "Model review", "status": "completed", "conclusion": "failure"}]}]
+        result, _ = self.prepare(env={**GATE_ENV, "GITHUB_RUN_ATTEMPT": "2"})
+        self.assertEqual(result.reason, "rerun-not-allowed")
+        # 환경 변수가 1 이라고 주장해도 API 의 run_attempt 가 2 면 막는다
+        result, handoff = self.prepare()
+        self.assertEqual((result.status, result.reason, handoff), ("blocked", "rerun-not-allowed", ""))
+
+    def test_first_attempt_still_works(self) -> None:
+        result, out = self.full()
+        self.assertEqual(result.status, "reviewed")
+        self.assertEqual(len(self.transport.calls), 1)
+
+    def test_event_pr_identifier_must_be_exactly_the_resolved_pr(self) -> None:
+        """이벤트 PR 목록이 정확히 [확정된 PR] 이 아니면 run-name 에 그 PR 이 기록된다고 볼 수 없다."""
+        cases = {
+            "empty": [],  # API 로는 PR 을 찾을 수 있지만 추측하지 않는다
+            "extra-after": [{"number": PR}, {"number": PR + 1}],
+            "extra-before": [{"number": PR + 1}, {"number": PR}],  # run-name 은 [0] = 다른 PR
+        }
+        for name, prs in cases.items():
+            with self.subTest(case=name):
+                self.gh = PipelineGitHub()  # API 로 확정되는 PR 은 PR 하나뿐
+                result, handoff = self.prepare(payload=event(pull_requests=prs))
+                self.assertEqual((result.status, result.reason, handoff), ("blocked", "run-name-pr-untracked", ""))
+
+    def test_current_run_name_must_record_pr_and_sha(self) -> None:
+        for title in (f"ai-review pr= head={SHA}", f"ai-review pr={PR + 1} head={SHA}",
+                      f"ai-review pr={PR} head={OTHER_SHA}", "ai-review", None):
+            with self.subTest(title=title):
+                self.gh = PipelineGitHub()
+                self.gh.current_run["display_title"] = title
+                result, handoff = self.prepare()
+                self.assertEqual((result.status, result.reason, handoff), ("blocked", "run-name-pr-untracked", ""))
+
+    def test_current_run_lookup_errors_fail_closed(self) -> None:
+        self.gh.fail_on = f"/actions/runs/{CURRENT_RUN}"
+        self.assertEqual(self.prepare()[0].reason, "github-api-error")
+        self.gh = PipelineGitHub()
+        self.gh.current_run = ["not", "a", "dict"]
+        self.assertEqual(self.prepare()[0].reason, "github-unexpected-response")
+
+    def test_off_still_wins(self) -> None:
+        result, _ = self.prepare(env={"GITHUB_RUN_ATTEMPT": "2"})
+        self.assertEqual((result.status, result.reason), ("disabled", "flag-off"))
+
+
 # --- 전달 파일 변조 ---
 
 
@@ -439,7 +528,8 @@ class CliTest(NoNetwork):
         base = {"PATH": os.environ.get("PATH", "")}
         for argv, env, code, text in (
             (["prepare"], base, 3, "result=disabled reason=flag-off"),
-            (["review"], {**base, "AI_REVIEW_ENABLED": "true"}, 3, "reason=no-api-key"),
+            (["review"], {**base, "AI_REVIEW_ENABLED": "true", "GITHUB_RUN_ATTEMPT": "1"}, 3, "reason=no-api-key"),
+            (["review"], {**base, "AI_REVIEW_ENABLED": "true", "GITHUB_RUN_ATTEMPT": "2"}, 2, "reason=rerun-not-allowed"),
         ):
             with self.subTest(argv=argv):
                 proc = subprocess.run([sys.executable, "-I", "-B", str(script), *argv], env=env,
