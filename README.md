@@ -20,6 +20,6 @@ docker compose up -d
 
 - compose.yaml: 서비스 정의
 - .env.example: 환경변수 양식
-- sites/: 사이트 프로필 (SITE-EXAMPLE.json만 추적)
+- sites/: 사이트 프로필 (SITE-EXAMPLE.yaml만 추적)
 - modules/: 모듈별 디렉터리
 - docs/lessons/: Lesson 기록
