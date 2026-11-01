@@ -299,9 +299,21 @@ class PullTest(NoNetwork):
         self.check(lambda g: g.pull.update(user={"login": "someone-else"}), "pr-author-not-owner")
 
     def test_head_branch_not_allowed(self) -> None:
-        for ref in ("docs/issue-5-phase1-evidence-20261101", "test/routine-pr-open-20261101", "main", "claude"):
+        for ref in ("docs/issue-5-phase1-evidence-20261101", "main", "claude",
+                    # 시범 예외(PILOT_HEAD_REFS)와 비슷하지만 정확히 같지 않은 이름은 허용하지 않는다
+                    "test/routine-pr-open-20261101-x", "test/routine-pr-open", "test/other", "TEST/routine-pr-open-20261101"):
             with self.subTest(ref=ref):
                 self.check(lambda g, ref=ref: g.pull["head"].update(ref=ref), "pr-head-branch-not-allowed")
+
+    def test_pilot_head_branch_allowed_exactly(self) -> None:
+        """Issue #5 Phase 2-D: 테스트 PR #10 의 head 브랜치만 정확히 일치할 때 예외로 허용."""
+        self.assertEqual(rb.PILOT_HEAD_REFS, ("test/routine-pr-open-20261101",))
+        gh = FakeGitHub()
+        gh.pull["head"]["ref"] = "test/routine-pr-open-20261101"
+        transport = FakeTransport()
+        result = self.run_bridge(gh=gh, transport=transport)
+        self.assertEqual(result.status, "delivered")
+        self.assertEqual(len(transport.calls), 1)
 
     def test_head_sha_changed(self) -> None:
         self.check(lambda g: g.pull["head"].update(sha=OTHER_SHA), "stale-head")

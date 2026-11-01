@@ -28,7 +28,7 @@ REPO = ar.TRUSTED_REPO
 OWNER = REPO.split("/", 1)[0]
 SHA = "c" * 40
 OTHER_SHA = "d" * 40
-PR = 21
+PR = 10  # 시범 운영 대상 PR (review_pipeline.PILOT_PR_NUMBERS)
 ISSUE = 9
 RUN_ID = 41260032790
 CI_WORKFLOW_ID = 402802049
@@ -809,11 +809,38 @@ class MarkerContractTest(NoNetwork):
 # --- 워크플로 안전 조건 (문자열 검사. YAML 문법 검사는 아님) ---
 
 
+def workflow_jobs(code: str) -> dict[str, str]:
+    """워크플로 텍스트를 job 이름별 블록으로 나눈다 (들여쓰기 2칸 키 기준. YAML 파서 없이)."""
+    body = code.split("\njobs:\n", 1)[1]
+    jobs: dict[str, str] = {}
+    name = None
+    for line in body.splitlines():
+        if line.startswith("  ") and not line.startswith("   ") and line.rstrip().endswith(":"):
+            name = line.strip()[:-1]
+            jobs[name] = ""
+        elif name:
+            jobs[name] += line + "\n"
+    return jobs
+
+
+def step_block(job: str, step_name: str) -> str:
+    part = job.split(f"      - name: {step_name}\n", 1)[1]
+    return part.split("      - name: ", 1)[0]
+
+
 class WorkflowGuardTest(unittest.TestCase):
+    """ai-review.yml 의 안전 조건 (문자열 검사. YAML 문법 검사는 아님). Phase 2-D: job 3개, Secret·쓰기 권한 분리."""
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.text = WORKFLOW.read_text(encoding="utf-8")
         cls.code = "\n".join(line.split("#", 1)[0] for line in cls.text.splitlines())
+        cls.jobs = workflow_jobs(cls.code)
+
+    def test_jobs(self) -> None:
+        self.assertEqual(list(self.jobs), ["review", "publish", "forward"])
+        self.assertIn("needs: review", self.jobs["publish"])
+        self.assertIn("needs: publish", self.jobs["forward"])
 
     def test_trigger_is_trusted_ci_completion_only(self) -> None:
         self.assertIn("workflow_run:", self.code)
@@ -823,38 +850,56 @@ class WorkflowGuardTest(unittest.TestCase):
                            "workflow_dispatch", "repository_dispatch"):
             self.assertNotIn(event_name, self.code)
 
-    def test_no_secrets_or_api_key_wired(self) -> None:
-        self.assertNotIn("secrets.", self.code)
-        self.assertNotIn("OPENAI_API_KEY:", self.code)
+    def test_secrets_only_in_the_step_that_needs_them(self) -> None:
+        self.assertEqual(self.code.count("secrets."), 3)
+        model = step_block(self.jobs["review"], "Model review")
+        self.assertIn("OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}", model)
+        forward = step_block(self.jobs["forward"], "Forward to Claude Routine")
+        self.assertIn("CLAUDE_ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}", forward)
+        self.assertIn("CLAUDE_ROUTINE_TRIGGER_ID: ${{ secrets.CLAUDE_ROUTINE_TRIGGER_ID }}", forward)
+        self.assertNotIn("secrets.", step_block(self.jobs["review"], "Prepare (gates, no model key)"))
+        self.assertNotIn("secrets.", self.jobs["publish"])  # 쓰기 권한 job 에는 Secret 없음
+        self.assertNotIn("OPENAI_API_KEY", self.jobs["forward"])
+        self.assertNotIn("CLAUDE_ROUTINE", self.jobs["review"])
 
-    def test_off_by_default_gate(self) -> None:
+    def test_off_by_default_and_pilot_gate(self) -> None:
         for cond in (
             "vars.AI_REVIEW_ENABLED == 'true'",
             "github.event.workflow_run.event == 'pull_request'",
             "github.event.workflow_run.conclusion == 'success'",
             "github.event.workflow_run.head_repository.full_name == github.repository",
+            "github.event.workflow_run.pull_requests[0].number == 10",
         ):
-            self.assertIn(cond, self.code)
+            self.assertIn(cond, self.jobs["review"])
+        self.assertIn("vars.AI_REVIEW_PUBLISH == 'true'", self.jobs["publish"])
+        self.assertIn("vars.ROUTINE_BRIDGE_ENABLED == 'true'", self.jobs["forward"])
+        self.assertIn("needs.publish.outputs.outcome == 'needs_changes'", self.jobs["forward"])
 
-    def test_permissions_read_only(self) -> None:
+    def test_write_permission_only_in_publish(self) -> None:
         self.assertIn("permissions: {}", self.code)
-        self.assertNotIn(": write", self.code)
+        self.assertEqual(self.code.count(": write"), 1)
+        self.assertIn("pull-requests: write", self.jobs["publish"])
+        for name in ("review", "forward"):
+            self.assertNotIn(": write", self.jobs[name])
         self.assertNotIn("write-all", self.code)
+        self.assertNotIn("contents: write", self.code)
 
     def test_no_pr_head_checkout(self) -> None:
         self.assertNotIn("ref:", self.code)
-        steps = self.code.split("steps:", 1)[1]
-        # head SHA·브랜치는 run-name(기록용 라벨)·concurrency 에만 쓰고, checkout·step 에서는 쓰지 않는다
-        self.assertNotIn("head_sha", steps)
-        self.assertNotIn("head_branch", steps)
-        self.assertIn("persist-credentials: false", self.code)
+        for name, job in self.jobs.items():
+            steps = job.split("steps:", 1)[1]
+            with self.subTest(job=name):
+                # head SHA·브랜치는 run-name·concurrency 에만. checkout·step 에서 workflow_run 의 head 를 쓰지 않는다
+                self.assertNotIn("workflow_run.head_sha", steps)
+                self.assertNotIn("head_branch", steps)
+        self.assertEqual(self.code.count("persist-credentials: false"), 3)
 
     def test_only_pinned_checkout_action(self) -> None:
         uses = [line.strip() for line in self.code.splitlines() if "uses:" in line]
-        self.assertEqual(uses, ["uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"])
+        self.assertEqual(uses, ["uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"] * 3)
 
     def test_timeout_and_concurrency(self) -> None:
-        self.assertIn("timeout-minutes:", self.code)
+        self.assertEqual(self.code.count("timeout-minutes:"), 3)
         self.assertIn("group: ai-review-", self.code)
 
     def test_values_passed_via_env_only(self) -> None:
@@ -862,13 +907,9 @@ class WorkflowGuardTest(unittest.TestCase):
         self.assertEqual(run_lines, [
             "        run: python3 -I -B scripts/automation/review_pipeline.py prepare",
             "        run: python3 -I -B scripts/automation/review_pipeline.py review",
+            "        run: python3 -I -B scripts/automation/review_pipeline.py publish",
+            "        run: python3 -I -B scripts/automation/review_pipeline.py forward",
         ])
-
-    def test_no_publish_stage_or_model_key(self) -> None:
-        self.assertNotIn("review_pipeline.py publish", self.code)
-        self.assertNotIn("AI_REVIEW_PUBLISH", self.code)
-        self.assertNotIn("OPENAI_API_KEY:", self.code)
-        self.assertEqual(self.code.count("uses:"), 1)
 
 
 if __name__ == "__main__":

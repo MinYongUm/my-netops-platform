@@ -40,6 +40,8 @@ TRUSTED_REPO = "MinYongUm/my-netops-platform"
 BASE_BRANCH = "main"
 # 자동 수정 세션으로 넘겨도 되는 head 브랜치. docs/·test/ 등 사람이 소유한 브랜치는 넘기지 않는다
 ALLOWED_HEAD_PREFIXES = ("claude/",)
+# 시범 운영(Issue #5 Phase 2-D): 테스트 PR #10 의 head 브랜치만 정확히 일치할 때 예외로 허용한다
+PILOT_HEAD_REFS = ("test/routine-pr-open-20261101",)
 CI_CHECK_NAME = "static-checks"
 CI_APP_SLUG = "github-actions"
 REVIEWER_LOGIN = "github-actions[bot]"
@@ -199,7 +201,7 @@ def verify_pull(gh: GitHub, req: Request, repo: str) -> Result | None:
     if (pull.get("user") or {}).get("login") != owner:
         return Result("blocked", "pr-author-not-owner")
     head_ref = head.get("ref") or ""
-    if not head_ref.startswith(ALLOWED_HEAD_PREFIXES):
+    if not head_ref.startswith(ALLOWED_HEAD_PREFIXES) and head_ref not in PILOT_HEAD_REFS:
         return Result("blocked", "pr-head-branch-not-allowed")
     if head.get("sha") != req.head_sha:
         return Result("blocked", "stale-head")

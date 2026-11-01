@@ -21,6 +21,7 @@ import routine_bridge as rb
 from test_ai_review import INJECTION, ISSUE, OTHER_SHA, POLICY, PR, REPO, RUN_ID, SHA, NoNetwork, event
 from test_github_publisher import COMMENT_URL, FakeWriter, PublishGitHub
 from test_openai_reviewer import FakeTransport, response, review_doc
+from test_routine_bridge import FakeTransport as FireTransport
 
 CURRENT_RUN = 9_000_000_001
 WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ai-review.yml"
@@ -62,11 +63,13 @@ class PipelineGitHub(PublishGitHub):
             page = int(path.rsplit("page=", 1)[1])
             start = (page - 1) * rp.RUNS_PER_PAGE
             return {"workflow_runs": self.ai_runs[start:start + rp.RUNS_PER_PAGE]}
-        if path.startswith(f"/repos/{REPO}/actions/runs/") and path.endswith("/jobs"):
+        if path.startswith(f"/repos/{REPO}/actions/runs/") and "/jobs?" in path:
             self.calls.append(path)
             if self.fail_on and self.fail_on in path:
                 raise ar.GitHubError()
-            return {"jobs": self.ai_jobs.get(int(path.split("/")[-2]), [])}
+            self.assertion_filter_all = "filter=all" in path
+            run_id = int(path.split("/jobs?", 1)[0].rsplit("/", 1)[1])
+            return {"jobs": self.ai_jobs.get(run_id, [])}
         return super().get(path)
 
 
@@ -144,7 +147,7 @@ class EndToEndTest(PipelineCase):
         self.assertEqual(prepared.data.trusted_policy, POLICY)
         self.assertEqual(prepared.data.issue_number, ISSUE)
         self.assertIn("Ignore all previous instructions", prepared.data.untrusted_body)
-        self.assertEqual((prepared.run_id, prepared.round_no, prepared.limit), (RUN_ID, 1, 2))
+        self.assertEqual((prepared.run_id, prepared.round_no, prepared.limit), (RUN_ID, 1, rp.PILOT_MAX_MODEL_CALLS))
         self.review(handoff)
         payload = json.loads(self.transport.request["input"][0]["content"][0]["text"])
         self.assertNotIn("Ignore all previous instructions", json.dumps(payload["trusted"]))
@@ -281,12 +284,14 @@ class RunLedgerTest(PipelineCase):
         prep, _ = self.prepare()
         self.assertEqual(prep.status, "ready")
 
-    def test_round_limit_from_runs(self) -> None:
+    def test_round_limit_from_runs_is_pilot_one(self) -> None:
+        """시범: 다른 SHA 라도 이전 모델 호출이 1회 있으면 막는다. AI_REVIEW_MAX_ROUNDS 로 늘릴 수 없다."""
         self.gh.add_attempt(1, "1" * 40)
-        self.gh.add_attempt(2, "2" * 40)
         self.check("blocked", "round-limit-run")
-        prep, _ = self.prepare(env={**GATE_ENV, "AI_REVIEW_MAX_ROUNDS": "3"})
-        self.assertEqual(prep.status, "ready")
+        for raw in ("2", "3"):
+            with self.subTest(max_rounds=raw):
+                prep, _ = self.prepare(env={**GATE_ENV, "AI_REVIEW_MAX_ROUNDS": raw})
+                self.assertEqual((prep.status, prep.reason), ("blocked", "round-limit-run"))
 
     def test_current_run_other_pr_and_bad_titles_ignored(self) -> None:
         self.gh.add_attempt(CURRENT_RUN, SHA)  # 지금 실행 중인 자신
@@ -403,6 +408,207 @@ class RerunAndIdentityTest(PipelineCase):
         self.assertEqual((result.status, result.reason), ("disabled", "flag-off"))
 
 
+# --- 시범 운영 제한 (Phase 2-D) ---
+
+FIRE_ENV = {**GATE_ENV, "ROUTINE_BRIDGE_ENABLED": "true", "CLAUDE_ROUTINE_TOKEN": "fake-routine-token-for-tests-only",
+            "CLAUDE_ROUTINE_TRIGGER_ID": "trig_01TESTONLY"}
+
+
+class BridgeGitHub:
+    """routine_bridge 가 보는 GitHub. PR·check-run 은 PipelineGitHub 에, 게시된 코멘트는 writer 기록에서 응답한다."""
+
+    def __init__(self, gh: PipelineGitHub, posted_body: str, comment_id: int = 123) -> None:
+        self.gh = gh
+        self.body = posted_body
+        self.comment_id = comment_id
+        self.calls: list[str] = []
+
+    def get(self, path: str) -> object:
+        self.calls.append(path)
+        if path == f"/repos/{REPO}/issues/comments/{self.comment_id}":
+            return {"issue_url": f"https://api.github.com/repos/{REPO}/issues/{PR}",
+                    "user": {"login": "github-actions[bot]", "type": "Bot"}, "body": self.body}
+        if path.startswith(f"/repos/{REPO}/actions/workflows/routine-bridge.yml/runs?"):
+            return {"workflow_runs": []}
+        return self.gh.get(path)
+
+
+class PilotTest(PipelineCase):
+    def test_constants(self) -> None:
+        self.assertEqual((rp.PILOT_PR_NUMBERS, rp.PILOT_MAX_MODEL_CALLS, rp.PILOT_MAX_COMMENTS, rp.PILOT_MAX_TRIGGERS),
+                         ((10,), 1, 1, 1))
+        self.assertEqual(PR, 10)
+
+    def test_non_pilot_pr_blocked_before_ledgers_and_model(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(rp, "PILOT_PR_NUMBERS", (99,)):  # 이 테스트에서는 PR 10 이 시범 대상이 아님
+            result, handoff = self.prepare()
+        self.assertEqual((result.status, result.reason, handoff), ("blocked", "pr-not-in-pilot", ""))
+        self.assertFalse(any("ai-review.yml/runs" in c for c in self.gh.calls))  # 실행 기록 조회 전에 멈춤
+        self.assertFalse(any(f"/actions/runs/{CURRENT_RUN}" in c for c in self.gh.calls))
+
+    def test_review_stage_rechecks_pilot_and_limit(self) -> None:
+        _, handoff = self.prepare()
+        doc = json.loads(handoff)
+        for tampered in (dict(doc, input=dict(doc["input"], pr_number=PR + 1)),
+                         dict(doc, limit=2, input=dict(doc["input"], max_rounds=2))):
+            with self.subTest():
+                result, out = self.review(json.dumps(tampered))
+                self.assertEqual((result.status, result.reason, out), ("blocked", "pr-not-in-pilot", ""))
+                self.assertEqual(self.transport.calls, [])
+
+    def test_publish_stage_pilot_attempt_and_run_id(self) -> None:
+        _, out = self.full()
+        doc = json.loads(out)
+        other = json.dumps(dict(doc, pr_number=PR + 1, planned_comment=doc["planned_comment"].replace(f"#{PR},", f"#{PR + 1},")))
+        pub = self.publish(other)
+        self.assertEqual((pub.status, pub.reason), ("blocked", "pr-not-in-pilot"))
+        pub_env = {**MODEL_ENV, "AI_REVIEW_PUBLISH": "true"}
+        self.assertEqual(self.publish(out, env={**pub_env, "GITHUB_RUN_ATTEMPT": "2"}).reason, "rerun-not-allowed")
+        no_id = dict(pub_env)
+        del no_id["GITHUB_RUN_ID"]
+        self.assertEqual(self.publish(out, env=no_id).reason, "no-run-id")
+        self.assertEqual(self.writer.calls, [])
+
+    def test_one_comment_per_pr(self) -> None:
+        _, out = self.full()
+        self.gh.ai_runs.append({"id": 5, "display_title": f"ai-review pr={PR} head={OTHER_SHA}"})
+        self.gh.ai_jobs[5] = [{"name": "publish", "steps": [
+            {"name": "Publish review comment", "status": "completed", "conclusion": "failure"}]}]
+        pub = self.publish(out)
+        self.assertEqual((pub.status, pub.reason), ("blocked", "comment-limit-run"))
+        self.assertEqual(self.writer.calls, [])
+
+    def test_comment_marker_limit_is_one(self) -> None:
+        from test_ai_review import bot_comment
+
+        _, out = self.full()
+        self.gh.comments = [bot_comment(OTHER_SHA)]  # 다른 SHA 의 리뷰 코멘트가 이미 1개
+        pub = self.publish(out)
+        self.assertEqual((pub.status, pub.reason), ("blocked", "round-limit"))
+        self.assertEqual(self.writer.calls, [])
+
+
+class ForwardTest(PipelineCase):
+    def end_to_end(self, transport=None):
+        result, out = self.full(transport)
+        pub = self.publish(out)
+        self.assertEqual(pub.status, "posted")
+        body = self.writer.calls[0][1]["body"]
+        bridge_gh = BridgeGitHub(self.gh, body)
+        return result, pub, bridge_gh
+
+    def forward(self, bridge_gh, env=None, fire=None, url=None):
+        self.fire = fire or FireTransport()
+        env = {**FIRE_ENV, "BRIDGE_PR_NUMBER": str(PR), "BRIDGE_HEAD_SHA": SHA,
+               "BRIDGE_REVIEW_URL": url or f"https://github.com/{REPO}/pull/{PR}#issuecomment-123", **(env or {})}
+        return rp.stage_forward(env, self.factory, lambda: bridge_gh, self.fire)
+
+    def test_full_pipeline_review_comment_to_claude_once(self) -> None:
+        result, pub, bridge_gh = self.end_to_end()
+        self.assertEqual(result.outcome, "needs_changes")
+        res = self.forward(bridge_gh)
+        self.assertEqual((res.status, res.reason), ("delivered", "fired"))
+        self.assertEqual(len(self.transport.calls), 1)  # 모델 1회
+        self.assertEqual(len(self.writer.calls), 1)  # 코멘트 1개
+        self.assertEqual(len(self.fire.calls), 1)  # Claude 트리거 1회
+        url, headers, body, _ = self.fire.calls[0]
+        text = json.loads(body)["text"]
+        self.assertIn(f"pull_request: https://github.com/{REPO}/pull/{PR}", text)
+        self.assertIn(f"head_sha: {SHA}", text)
+        self.assertNotIn("fake-routine-token", text)
+        self.assertNotIn(INJECTION, text)  # PR·코멘트 내용은 넣지 않는다
+
+    def test_pilot_head_branch_is_forwarded(self) -> None:
+        self.gh.pull["head"]["ref"] = "test/routine-pr-open-20261101"
+        _, _, bridge_gh = self.end_to_end()
+        self.assertEqual(self.forward(bridge_gh).status, "delivered")
+
+    def test_off_and_missing_secrets_make_no_calls(self) -> None:
+        _, _, bridge_gh = self.end_to_end()
+        before = len(bridge_gh.calls)
+        cases = {
+            ("disabled", "flag-off"): {"AI_REVIEW_ENABLED": ""},
+            ("disabled", "flag-off "): {"ROUTINE_BRIDGE_ENABLED": ""},
+            ("disabled", "no-token"): {"CLAUDE_ROUTINE_TOKEN": ""},
+            ("disabled", "no-trigger-id"): {"CLAUDE_ROUTINE_TRIGGER_ID": ""},
+            ("blocked", "rerun-not-allowed"): {"GITHUB_RUN_ATTEMPT": "2"},
+        }
+        for (status, reason), over in cases.items():
+            with self.subTest(reason=reason):
+                res = self.forward(bridge_gh, env=over)
+                self.assertEqual((res.status, res.reason), (status, reason.strip()))
+                self.assertEqual(self.fire.calls, [])
+        self.assertEqual(len(bridge_gh.calls), before)
+
+    def test_trigger_limit_one(self) -> None:
+        _, _, bridge_gh = self.end_to_end()
+        self.gh.ai_runs.append({"id": 6, "display_title": f"ai-review pr={PR} head={OTHER_SHA}"})
+        self.gh.ai_jobs[6] = [{"name": "forward", "steps": [
+            {"name": "Forward to Claude Routine", "status": "completed", "conclusion": "success"}]}]
+        res = self.forward(bridge_gh)
+        self.assertEqual((res.status, res.reason), ("blocked", "trigger-limit-run"))
+        self.assertEqual(self.fire.calls, [])
+
+    def test_non_pilot_and_bad_inputs(self) -> None:
+        _, _, bridge_gh = self.end_to_end()
+        res = self.forward(bridge_gh, env={"BRIDGE_PR_NUMBER": str(PR + 1)},
+                           url=f"https://github.com/{REPO}/pull/{PR + 1}#issuecomment-123")
+        self.assertEqual((res.status, res.reason), ("blocked", "pr-not-in-pilot"))
+        res = self.forward(bridge_gh, url=f"https://github.com/{REPO}/pull/{PR + 1}#issuecomment-123")
+        self.assertEqual(res.reason, "invalid-input:review_url-pr-mismatch")
+        self.assertEqual(self.fire.calls, [])
+
+    def test_bridge_still_rejects_non_needs_changes(self) -> None:
+        result, out = self.full(FakeTransport(body=response(json.dumps(review_doc("no_changes")))))
+        self.publish(out)
+        bridge_gh = BridgeGitHub(self.gh, self.writer.calls[0][1]["body"])
+        res = self.forward(bridge_gh)
+        self.assertEqual((res.status, res.reason), ("blocked", "review-no-changes"))
+        self.assertEqual(self.fire.calls, [])
+
+    def test_fire_errors_are_failed_no_retry(self) -> None:
+        _, _, bridge_gh = self.end_to_end()
+        res = self.forward(bridge_gh, fire=FireTransport(status=429, body=b""))
+        self.assertEqual(res.status, "failed")
+        self.assertEqual(len(self.fire.calls), 1)
+
+
+class AttemptHistoryTest(PipelineCase):
+    def test_earlier_attempt_of_rerun_run_is_counted(self) -> None:
+        """재실행된 run: 마지막 attempt 는 skipped 여도 첫 attempt 의 모델 호출을 센다 (jobs filter=all)."""
+        self.gh.ai_runs.append({"id": 7, "display_title": f"ai-review pr={PR} head={OTHER_SHA}"})
+        self.gh.ai_jobs[7] = [
+            {"name": "review", "run_attempt": 1, "steps": [{"name": "Model review", "status": "completed", "conclusion": "success"}]},
+            {"name": "review", "run_attempt": 2, "steps": [{"name": "Model review", "status": "completed", "conclusion": "skipped"}]},
+        ]
+        result, _ = self.prepare()
+        self.assertEqual((result.status, result.reason), ("blocked", "round-limit-run"))
+        self.assertTrue(self.gh.assertion_filter_all)
+
+
+class StageOutputTest(NoNetwork):
+    def test_publish_cli_reads_job_output_b64(self) -> None:
+        import base64
+
+        body = ar.render_comment(REPO, PR, SHA, RUN_ID, 1, 1, "needs_changes",
+                                 ar.ReviewOutcome("needs_changes", "s", (ar.Finding("Minor", "f", 1, "t"),)))
+        text = rp.dump_result(ar.Result("reviewed", "planned-not-posted", "needs_changes", PR, SHA, body), RUN_ID)
+        b64 = base64.b64encode(text.encode()).decode()
+        self.assertEqual(rp._decode_b64(b64), text)
+        self.assertEqual(rp._decode_b64("@@not-base64@@"), "")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = rp.main(["publish"], {"AI_REVIEW_RESULT_B64": b64, "GITHUB_TOKEN": "fake"})
+        self.assertEqual((code, "result=dry_run" in buf.getvalue()), (0, True))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = rp.main(["publish"], {"AI_REVIEW_RESULT_B64": "@@bad@@", "GITHUB_TOKEN": "fake"})
+        self.assertEqual(code, 1)
+        self.assertIn("reason=handoff-invalid", buf.getvalue())
+
+
 # --- 전달 파일 변조 ---
 
 
@@ -496,7 +702,7 @@ class CliTest(NoNetwork):
             self.assertIn("result=disabled reason=flag-off", text)
             self.assertFalse(out.exists())
             self.assertFalse((Path(tmp) / "h.json").exists())
-            self.assertIn("AI 리뷰 완료·코멘트 게시가 아니다", summary.read_text(encoding="utf-8"))
+            self.assertIn("AI 리뷰 완료·코멘트 게시·Claude 전달이 아니다", summary.read_text(encoding="utf-8"))
 
     def test_review_without_key_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,6 +736,7 @@ class CliTest(NoNetwork):
             (["prepare"], base, 3, "result=disabled reason=flag-off"),
             (["review"], {**base, "AI_REVIEW_ENABLED": "true", "GITHUB_RUN_ATTEMPT": "1"}, 3, "reason=no-api-key"),
             (["review"], {**base, "AI_REVIEW_ENABLED": "true", "GITHUB_RUN_ATTEMPT": "2"}, 2, "reason=rerun-not-allowed"),
+            (["forward"], {**base, "AI_REVIEW_ENABLED": "true", "GITHUB_RUN_ATTEMPT": "1"}, 3, "routine-bridge result=disabled reason=flag-off"),
         ):
             with self.subTest(argv=argv):
                 proc = subprocess.run([sys.executable, "-I", "-B", str(script), *argv], env=env,
@@ -551,7 +758,8 @@ class WorkflowContractTest(unittest.TestCase):
         cls.text = WORKFLOW.read_text(encoding="utf-8")
 
     def test_model_step_name_and_gate(self) -> None:
-        self.assertIn(f"      - name: {rp.MODEL_STEP}\n        if: steps.prepare.outputs.ready == 'true'", self.text)
+        self.assertIn(f"      - name: {rp.MODEL_STEP}\n        id: model\n        if: steps.prepare.outputs.ready == 'true'",
+                      self.text)
         self.assertIn(f"  {rp.REVIEW_JOB}:\n    name: {rp.REVIEW_JOB}", self.text)
 
     def test_run_name_matches_ledger_regex(self) -> None:
@@ -560,6 +768,18 @@ class WorkflowContractTest(unittest.TestCase):
                     .replace("${{ github.event.workflow_run.pull_requests[0].number }}", str(PR))
                     .replace("${{ github.event.workflow_run.head_sha }}", SHA))
         self.assertEqual(rp.RUN_NAME_RE.fullmatch(rendered).groups(), (str(PR), SHA))
+
+    def test_stage_steps_and_job_outputs(self) -> None:
+        self.assertIn(f"  {rp.PUBLISH_JOB}:\n    name: {rp.PUBLISH_JOB}", self.text)
+        self.assertIn(f"  {rp.FORWARD_JOB}:\n    name: {rp.FORWARD_JOB}", self.text)
+        self.assertIn(f"      - name: {rp.PUBLISH_STEP}\n        id: post", self.text)
+        self.assertIn(f"      - name: {rp.FORWARD_STEP}\n", self.text)
+        self.assertIn("result_b64: ${{ steps.model.outputs.result_b64 }}", self.text)
+        self.assertIn("AI_REVIEW_RESULT_B64: ${{ needs.review.outputs.result_b64 }}", self.text)
+        for key in ("comment_url", "outcome", "pr_number", "head_sha"):
+            self.assertIn(f"{key}: ${{{{ steps.post.outputs.{key} }}}}", self.text)
+        self.assertIn("BRIDGE_REVIEW_URL: ${{ needs.publish.outputs.comment_url }}", self.text)
+        self.assertIn(f"pull_requests[0].number == {rp.PILOT_PR_NUMBERS[0]}", self.text)
 
     def test_handoff_paths_shared_between_steps(self) -> None:
         self.assertEqual(self.text.count("AI_REVIEW_HANDOFF: ${{ runner.temp }}/ai-review-input.json"), 2)

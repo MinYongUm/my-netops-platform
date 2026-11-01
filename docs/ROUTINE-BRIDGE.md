@@ -86,7 +86,7 @@ PR (claude/ 브랜치) opened / synchronize
 | 전달 기록 | 같은 SHA로 전달한 적 없음, 전달 횟수 < 상한 | `duplicate-sha`, `round-limit`, `ledger-incomplete` |
 | 전달 직전 재확인 | PR을 다시 조회해 "PR" 단계 조건을 한 번 더 확인. 위 조회 사이에 새 커밋 push, close, base·브랜치 변경이 있으면 전달하지 않음. 조회 실패도 전달하지 않음 | "PR" 단계와 같음, `github-api-error` |
 
-`claude/` 브랜치 제한 때문에 문서 PR #8(`docs/…`)과 사용자 테스트 브랜치(`test/…`)는 전달 대상이 아니다.
+`claude/` 브랜치 제한 때문에 문서 PR #8(`docs/…`)과 사용자 테스트 브랜치(`test/…`)는 전달 대상이 아니다. 단, Issue #5 Phase 2-D 시범을 위해 PR #10의 head 브랜치 `test/routine-pr-open-20261101` **하나만** 정확히 일치할 때 예외로 허용한다(`PILOT_HEAD_REFS`). 시범 운영에서는 `ai-review.yml`의 `forward` job이 이 브리지 코드를 직접 호출한다(docs/AUTOMATION.md "Phase 2-D").
 
 전달 직전 재확인으로도 "재확인 ~ `/fire`" 사이의 짧은 간격은 없앨 수 없다. 그래서 Routine 세션도 시작할 때 head SHA를 다시 확인해야 한다 (아래 "권고 프롬프트").
 
