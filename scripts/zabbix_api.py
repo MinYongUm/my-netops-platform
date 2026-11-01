@@ -17,7 +17,7 @@ ADMIN_USER = "Admin"
 ADMIN_USERID = "1"  # Zabbix 설치 시 고정
 DEFAULT_ADMIN_PASSWORD = "zabbix"  # down -v 직후의 기본값
 
-log = logging.getLogger("bootstrap")
+log = logging.getLogger(__name__)
 
 
 class ApiError(Exception):

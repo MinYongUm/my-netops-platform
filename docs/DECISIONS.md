@@ -4,3 +4,4 @@
 
 - 2026-11-01 | 커밋 승인 시 Claude Code가 push까지 진행 | 승인 한 번으로 끝내기 위해. 허용 push는 git push, git push origin main만
 - 2026-11-01 | 커밋 전 reviewer 서브에이전트 리뷰 | 이 방과 Claude Code 간 수동 전달을 줄이기 위해
+- 2026-11-01 | zabbix_api.py 로거는 getLogger(__name__) | bootstrap 외 스크립트도 공용으로 쓰므로. 출력 형식에 이름이 없어 화면 출력은 같다
